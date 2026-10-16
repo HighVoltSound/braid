@@ -319,7 +319,8 @@ function unityProject(root, sln, rec) {
   // whatever the file times (they can be coarser than the clock). Otherwise a project Unity wrote later is the last
   // sign, and anything touched after it counts.
   const inputs = unityInputs(root, found);
-  const recorded = rec.hashes && (rec.t || 0) >= newest;
+  // The record holds whole ms; file times can carry a fraction of the same ms (macOS, Linux).
+  const recorded = rec.hashes && (rec.t || 0) >= Math.floor(newest);
   const changedInput = recorded
     ? Object.keys(rec.hashes).some(k => !exists(path.join(root, k))) || inputs.some(f => exists(f) && rec.hashes[rel(f)] !== hash(f))
     : inputs.some(f => touched(f) > newest);
