@@ -5,8 +5,7 @@ description: >
   project's real checks, gets a fresh-eyes review, tries to refute every
   finding, fixes what is real (bugs get a failing test first) and repeats
   until clean, at most 3 rounds. Any stack; knows Godot, Unreal and Unity. Use for
-  /braid, "braid this", "fix loop", "review and fix", "make it work",
-  "доведи до ума", "проверь и исправь".
+  /braid, "braid this", "fix loop", "review and fix".
 argument-hint: "[task | files | audit]"
 allowed-tools: Bash(node "${CLAUDE_PLUGIN_ROOT}/scripts/checks.js" *)
 ---

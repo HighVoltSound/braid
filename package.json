@@ -1,9 +1,12 @@
 {
   "name": "braid",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Claude Code plugin: build, check, review, refute, fix, repeat.",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test tests/braid.test.js tests/engines.test.js tests/godot.test.js"
   }

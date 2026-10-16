@@ -9,11 +9,11 @@ const { spawnSync } = require('child_process');
 // Everything (temp projects, gate state, fake Godot downloads) lives under one folder that is removed at the end.
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-test-'));
 process.env.HOME = process.env.USERPROFILE = ROOT;
-for (const v of ['CLAUDE_PROJECT_DIR', 'GODOT_BIN', 'GODOT', 'BRAID_GATE']) delete process.env[v];
+for (const v of ['CLAUDE_PROJECT_DIR', 'GODOT_BIN', 'GODOT', 'BRAID_GATE', 'CI', 'GITHUB_ACTIONS', 'CLAUDE_PLUGIN_OPTION_GATE', 'BRAID_CACHE_DIR', 'XDG_CACHE_HOME']) delete process.env[v];
 test.after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
 
-const { detect, run, snapshot, fingerprint, findGodot, readState, writeState } = require('../scripts/checks.js');
-const { gate, projects } = require('../hooks/gate.js');
+const { detect, run, killActive, snapshot, fingerprint, findGodot, readState, writeState, stateFile } = require('../scripts/checks.js');
+const { gate, projects, timeoutFor } = require('../hooks/gate.js');
 
 const WIN = process.platform === 'win32';
 let n = 0;
@@ -44,7 +44,7 @@ test('detect: other stacks by their project files', () => {
   const cases = [
     [{ 'go.mod': 'module x' }, ['go vet ./...', 'go test ./...']],
     [{ 'pom.xml': '<project/>' }, ['mvn -q test']],
-    [{ 'gradlew.bat': '', gradlew: '' }, [WIN ? 'gradlew.bat test --quiet' : './gradlew test --quiet']],
+    [{ 'gradlew.bat': '', gradlew: '' }, [WIN ? '.\\gradlew.bat test --quiet' : './gradlew test --quiet']],
     [{ 'Package.swift': '' }, ['swift test']],
     [{ 'mix.exs': '' }, ['mix test']],
     [{ 'deno.json': '{}' }, ['deno lint', 'deno check .', 'deno test -A']],
@@ -193,9 +193,9 @@ test('snapshot: Unity and Unreal caches are skipped, their source is not', () =>
 test('fingerprint: sees non-ASCII paths in a git repo', { skip: spawnSync('git', ['--version']).status !== 0 && 'no git' }, () => {
   const d = tmp();
   spawnSync('git', ['init', '-q'], { cwd: d });
-  write(d, 'сцены/игрок.gd', 'extends Node\n');
+  write(d, '場面/プレイヤー.gd', 'extends Node\n');
   const a = fingerprint(d);
-  write(d, 'сцены/игрок.gd', 'extends Node2D\n');
+  write(d, '場面/プレイヤー.gd', 'extends Node2D\n');
   assert.notStrictEqual(fingerprint(d), a);
 });
 
@@ -505,4 +505,150 @@ test('gate: a missing Godot binary does not block', async () => {
   await gate('turn', input);
   write(d, 'main.gd', 'extends Node2D\n');
   assert.strictEqual(await gate('stop', input), null);
+});
+
+// Sets env vars for one test (undefined unsets), then puts them back.
+async function withEnv(vars, fn) {
+  const old = Object.fromEntries(Object.keys(vars).map(k => [k, process.env[k]]));
+  const set = v => { for (const [k, x] of Object.entries(v)) { if (x === undefined) delete process.env[k]; else process.env[k] = x; } };
+  set(vars);
+  try { return await fn(); } finally { set(old); }
+}
+const gateJs = path.join(__dirname, '..', 'hooks', 'gate.js');
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+test('gate: off in CI unless BRAID_GATE is set, and off means no state at all', async () => {
+  for (const env of [{ CI: 'true' }, { GITHUB_ACTIONS: 'true' }, { BRAID_GATE: 'off' }, { CLAUDE_PLUGIN_OPTION_GATE: 'off' }, { CI: 'true', BRAID_GATE: 'false' }, { BRAID_GATE: '0' }]) {
+    const d = tmp();
+    write(d, 'main.js', 'ok\n');
+    cfg(d, { lint: lintBad }, { gate: 'fast' });
+    const input = { cwd: d, session_id: 'ci' };
+    await withEnv(env, async () => {
+      await gate('turn', input);
+      write(d, 'main.js', 'bad\n');
+      assert.strictEqual(await gate('stop', input), null, JSON.stringify(env));
+      assert.strictEqual(await gate('context', input), null);
+    });
+    assert.ok(!fs.existsSync(stateFile(d)), `${JSON.stringify(env)} wrote state`);
+  }
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'ci2' };
+  await withEnv({ CI: '1', BRAID_GATE: 'fast' }, async () => {
+    await gate('turn', input);
+    write(d, 'main.js', 'bad\n');
+    assert.strictEqual((await gate('stop', input)).decision, 'block');
+  });
+});
+
+test('gate: BRAID_GATE beats the plugin setting, which beats braid.json', async () => {
+  const stop = async (env, project) => {
+    const d = tmp();
+    write(d, 'main.js', 'ok\n');
+    cfg(d, { lint: lintBad }, { gate: project });
+    const input = { cwd: d, session_id: 'prec' };
+    return withEnv(env, async () => { await gate('turn', input); write(d, 'main.js', 'bad\n'); return gate('stop', input); });
+  };
+  assert.strictEqual((await stop({ CLAUDE_PLUGIN_OPTION_GATE: 'off', BRAID_GATE: 'fast' }, 'off')).decision, 'block');
+  assert.strictEqual((await stop({ CLAUDE_PLUGIN_OPTION_GATE: '' }, 'fast')).decision, 'block', 'an empty setting leaves it to braid.json');
+});
+
+test('gate: an unknown mode warns once and behaves as auto', async () => {
+  for (const [env, project, where] of [[{ BRAID_GATE: 'fastt' }, undefined, /BRAID_GATE/], [{}, 'bogus', /braid\.json/]]) {
+    const d = tmp();
+    write(d, 'main.js', 'ok\n');
+    cfg(d, { lint: `${node} -e "process.exit(0)"` }, { gate: project });
+    const input = { cwd: d, session_id: 'bad' };
+    const out = await withEnv(env, async () => { await gate('turn', input); write(d, 'main.js', 'changed\n'); return gate('stop', input); });
+    assert.match(out.reason, /braid autopilot/, 'auto: the review request');
+    assert.match(out.systemMessage, where);
+    assert.strictEqual(out.systemMessage.split('\n').length, 1, out.systemMessage);
+  }
+});
+
+test('gate: an internal error still lets Claude stop, and says what it was', () => {
+  const d = tmp();
+  write(d, 'file', '');
+  const r = spawnSync(process.execPath, [gateJs, 'turn'], { input: JSON.stringify({ cwd: d }), encoding: 'utf8', env: { ...process.env, BRAID_CACHE_DIR: path.join(d, 'file') } });
+  assert.strictEqual(r.status, 0);
+  assert.match(JSON.parse(r.stdout).systemMessage, /^braid: internal error: /);
+});
+
+test('gate: BRAID_TIMEOUT stays within the budget, and each check gets what is left', () => {
+  const t = v => spawnSync(process.execPath, ['-e', `require(${JSON.stringify(gateJs)}); console.log(process.env.BRAID_TIMEOUT)`], { encoding: 'utf8', env: { ...process.env, BRAID_TIMEOUT: v } }).stdout.trim();
+  assert.deepStrictEqual([t('9999'), t('30'), t('nonsense')], ['240', '30', '120']);
+  assert.strictEqual(timeoutFor({ timeoutMs: 5000 }, Date.now()), 5000);
+  assert.ok(timeoutFor({ timeoutMs: 1e9 }, Date.now() - 239000) <= 1000);
+});
+
+test('run: killActive stops the running checks', async () => {
+  const t = Date.now();
+  const r = run({ cmd: `${node} -e "setInterval(() => {}, 1000)"`, timeoutMs: 60000 }, tmp());
+  await sleep(500);
+  killActive();
+  assert.strictEqual((await r).ok, false);
+  assert.ok(Date.now() - t < 15000, 'should not wait for the timeout');
+});
+
+// On Windows Claude Code's kill ends the hook outright: no handler runs there.
+test('gate: a hook killed with SIGTERM takes its running check with it', { skip: WIN && 'no SIGTERM handlers on Windows' }, async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: `${node} -e "require('fs').writeFileSync('pid', String(process.pid)); setInterval(() => {}, 1000)"` }, { gate: 'fast' });
+  const input = { cwd: d, session_id: 'sig' };
+  await gate('turn', input);
+  write(d, 'main.js', 'changed\n');
+  const hook = require('child_process').spawn(process.execPath, [gateJs, 'stop'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  hook.stdin.end(JSON.stringify(input));
+  const pidFile = path.join(d, 'pid');
+  for (let i = 0; i < 100 && !fs.existsSync(pidFile); i++) await sleep(100);
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  const exited = new Promise(res => hook.on('exit', res));
+  hook.kill('SIGTERM');
+  await exited;
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  for (let i = 0; i < 30 && alive(); i++) await sleep(100);
+  assert.ok(!alive(), 'the check outlived the hook');
+});
+
+test('run, onPath: a command planted in the project folder is not run on Windows', { skip: !WIN && 'Windows only' }, async () => {
+  if (spawnSync('where', ['$PATH:gdlint']).status === 0) return; // a real gdlint is on PATH
+  const d = tmp();
+  write(d, 'gdlint.cmd', '@echo planted> planted.txt\r\n');
+  write(d, 'project.godot', 'config_version=4\n');
+  const cwd = process.cwd();
+  process.chdir(d);
+  try {
+    await withEnv({ NoDefaultCurrentDirectoryInExePath: undefined }, async () => {
+      assert.ok(!detect(d).some(c => c.name === 'gdlint'), 'onPath found the planted gdlint');
+      await run({ cmd: 'gdlint' }, d);
+    });
+  } finally { process.chdir(cwd); }
+  assert.ok(!fs.existsSync(path.join(d, 'planted.txt')));
+});
+
+test('run: the Gradle wrapper in the project folder runs on Windows', { skip: !WIN && 'Windows only' }, async () => {
+  const d = tmp();
+  write(d, 'build.gradle', '');
+  write(d, 'gradlew.bat', '@exit /b 0\r\n');
+  write(d, 'gradlew', '');
+  const r = await run(detect(d).find(c => c.name === 'test'), d);
+  assert.ok(r.ok, r.out);
+});
+
+test('state: written whole through a temp file, and stale files are pruned', async () => {
+  const d = tmp();
+  writeState(d, { a: 1 });
+  writeState(d, { a: 2 });
+  const dir = path.dirname(stateFile(d));
+  assert.deepStrictEqual(readState(d), { a: 2 });
+  assert.ok(!fs.readdirSync(dir).some(f => f.endsWith('.tmp')));
+  const old = (name, days) => { const p = path.join(dir, name); fs.writeFileSync(p, '{}'); const t = new Date(Date.now() - days * 864e5); fs.utimesSync(p, t, t); return p; };
+  const gone = [old('0123456789abcdef.json', 31), old('0123456789abcdef.unity-synced.json', 31), old('0123456789abcdef.1234abcd.snap.json', 8)];
+  const kept = [old('fedcba9876543210.json', 20), old('fedcba9876543210.unity-synced.json', 20), old('notes.txt', 400), old('report.xml', 30), old('x.tmp', 30)];
+  write(d, 'package.json', '{}');
+  await gate('turn', { cwd: d, session_id: 'prune' });
+  for (const p of gone) assert.ok(!fs.existsSync(p), `${p} kept`);
+  for (const p of kept) assert.ok(fs.existsSync(p), `${p} pruned`);
 });

@@ -8,16 +8,19 @@
 //   When Claude may stop, the next turn starts from here, whatever starts it.
 // Fails open: an error in here lets Claude stop.
 'use strict';
-// Per check; the hook itself is killed at 300 s, so the whole gate keeps under BUDGET_MS.
-process.env.BRAID_TIMEOUT = process.env.BRAID_TIMEOUT || '120';
+// The hook itself is killed at 300 s (hooks.json), so every check ends within BUDGET_MS of the start.
+const BUDGET_MS = 240000;
+// Per check, never above the budget; set before checks.js reads it.
+const perCheck = Number(process.env.BRAID_TIMEOUT);
+process.env.BRAID_TIMEOUT = String(perCheck > 0 ? Math.min(perCheck, BUDGET_MS / 1000) : 120);
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { detect, runAfter, report, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST } = require('../scripts/checks.js');
+const { detect, runAfter, killActive, report, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST } = require('../scripts/checks.js');
 
 const MAX_BLOCKS = 3;
-const BUDGET_MS = 240000;
+const MODES = ['auto', 'fast', 'all', 'off'];
 const MAX_LISTED = 40;
 const MARKERS = /^(project\.godot|package\.json|deno\.jsonc?|pyproject\.toml|requirements\.txt|setup\.py|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|Package\.swift|pubspec\.yaml|mix\.exs|Gemfile|composer\.json|Makefile|CMakeLists\.txt|.+\.(csproj|sln|uproject))$/;
 const LADDER = 'braid autopilot is on. When you write code, make the smallest complete change: skip what nobody asked for, ' +
@@ -25,7 +28,7 @@ const LADDER = 'braid autopilot is on. When you write code, make the smallest co
   'and only then the minimum new code. No abstraction, option or config nobody asked for. Reach every caller, scene and test ' +
   'the change touches, and give new non-trivial logic one small test.';
 
-// The folder itself if it is a project, else its direct subfolders that are (e.g. GODOT_PROJECTS/<game>).
+// The folder itself if it is a project, else its direct subfolders that are (e.g. projects/<game>).
 // A project has checks or at least a project file: code without checks still gets reviewed.
 function projects(dir) {
   const isProject = d => {
@@ -54,9 +57,16 @@ const snapFile = (root, id) => stateFile(root).replace(/\.json$/, `.${crypto.cre
 function saveSnap(root, id, snap) {
   const f = snapFile(root, id);
   writeSnap(f, snap);
-  for (const name of fs.readdirSync(path.dirname(f))) {
-    const p = path.join(path.dirname(f), name);
-    try { if (name.endsWith('.snap.json') && Date.now() - fs.statSync(p).mtimeMs > 7 * 864e5) fs.unlinkSync(p); } catch { /* gone */ }
+  prune(path.dirname(f));
+}
+// Snapshots and leftovers go after a week; a project's state and Unity record after a month without use.
+// Only braid's own files: they all start with a project hash, and the cache folder may be shared.
+const STALE = [[/^[0-9a-f]{16}\..*\.(snap\.json|tmp|xml)$/, 7], [/^[0-9a-f]{16}\.(unity-synced\.)?json$/, 30]];
+function prune(dir) {
+  for (const name of fs.readdirSync(dir)) {
+    const p = path.join(dir, name);
+    const days = (STALE.find(([re]) => re.test(name)) || [])[1];
+    try { if (days && Date.now() - fs.statSync(p).mtimeMs > days * 864e5) fs.unlinkSync(p); } catch { /* gone */ }
   }
 }
 // What changed since this session's turn began. A turn that a message of the user did not end can ask for a review
@@ -80,7 +90,36 @@ function ponytailOn(dir) {
   return [path.join(home, 'settings.json'), path.join(dir, '.claude', 'settings.json'), path.join(dir, '.claude', 'settings.local.json')].some(on);
 }
 
+// A known mode, or auto with a warning. People type these, so case and spaces do not matter.
+function validMode(v, from, warn) {
+  if (v == null || v === '') return undefined;
+  const m = String(v).trim().toLowerCase();
+  if (MODES.includes(m)) return m;
+  if (/^(0|false|no)$/.test(m)) return 'off';
+  warn(`braid: unknown gate mode "${v}" in ${from}, using auto (valid: ${MODES.join(', ')}).`);
+  return 'auto';
+}
+const isSet = v => Boolean(v) && !/^(0|false)$/i.test(v);
+// BRAID_GATE, then the plugin setting (userConfig, which admins can manage); unset, each project's braid.json decides.
+// In CI only BRAID_GATE turns it on: the hook runs the repo's own commands, and nobody is there to answer it.
+function envMode(warn) {
+  const env = process.env.BRAID_GATE;
+  if (!env && (isSet(process.env.CI) || isSet(process.env.GITHUB_ACTIONS))) return 'off';
+  return validMode(env, 'BRAID_GATE', warn) || validMode(process.env.CLAUDE_PLUGIN_OPTION_GATE, 'the plugin setting "gate"', warn);
+}
+// A check gets its own timeout, but never more than what is left of the budget.
+const timeoutFor = (c, t0) => Math.min(c.timeoutMs || Number(process.env.BRAID_TIMEOUT) * 1000, BUDGET_MS - (Date.now() - t0));
+
+// Warnings about the settings ride along with whatever the hook says.
 async function gate(event, input) {
+  const warnings = [];
+  const out = await hook(event, input, w => warnings.push(w));
+  return warnings.length ? { ...out, systemMessage: [...warnings, out && out.systemMessage].filter(Boolean).join('\n') } : out;
+}
+
+async function hook(event, input, warn) {
+  const env = envMode(warn);
+  if (env === 'off') return null; // fully off: no state, no detection
   // The project dir is stable; input.cwd follows Claude's `cd`.
   const dir = path.resolve(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
   const id = input.session_id || 'default';
@@ -101,7 +140,7 @@ async function gate(event, input) {
   const seen = [];
 
   for (const root of projects(dir)) {
-    const mode = process.env.BRAID_GATE || config(root).gate || 'auto';
+    const mode = env || validMode(config(root).gate, path.join(root, '.claude', 'braid.json'), warn) || 'auto';
     if (mode === 'off') continue;
     const checks = detect(root);
     const snap = snapshot(root);
@@ -156,9 +195,10 @@ async function gate(event, input) {
       const results = {};
       let complete = true;
       for (const c of fast) {
-        if (Date.now() - t0 > BUDGET_MS) { complete = false; notes.push(`braid gate: out of time before "${c.name}" in ${root}.`); break; }
+        c.timeoutMs = timeoutFor(c, t0);
+        if (c.timeoutMs <= 0) { complete = false; notes.push(`braid gate: out of time before "${c.name}" in ${root}.`); break; }
         const r = results[c.name] = await runAfter(c, root, results);
-        if (r.timedOut) { complete = false; notes.push(`braid gate: "${c.name}" in ${root} took longer than ${process.env.BRAID_TIMEOUT}s, so it was not checked.`); }
+        if (r.timedOut) { complete = false; notes.push(`braid gate: "${c.name}" in ${root} took longer than ${Math.round(c.timeoutMs / 1000)}s, so it was not checked.`); }
         else if (r.skipped) { complete = false; notes.push(`braid gate: ${report(c.name, c.cmd, r)} (${root})`); } // not a failure, but not proof either
         else if (!r.ok) fails.push(report(c.name, c.cmd, r));
       }
@@ -225,9 +265,9 @@ async function gate(event, input) {
   return notes.length ? { systemMessage: notes.join('\n') } : null;
 }
 
-// Session start: the ladder, unless the gate is off or ponytail is already injecting its own rules.
+// Session start: the ladder, unless ponytail is already injecting its own rules (an off gate never gets here).
 function context(dir) {
-  if (process.env.BRAID_GATE === 'off' || ponytailOn(dir)) return null;
+  if (ponytailOn(dir)) return null;
   return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: LADDER } };
 }
 
@@ -244,6 +284,8 @@ function readStdin() {
 }
 
 if (require.main === module) {
+  // Claude Code kills the hook at its timeout: the running check goes with it.
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { killActive(); process.exit(0); });
   const event = process.argv[2];
   readStdin()
     .then(async input => {
@@ -254,8 +296,9 @@ if (require.main === module) {
       return gate(['stop', 'context'].includes(event) ? event : 'turn', input);
     })
     .then(out => { if (out) process.stdout.write(JSON.stringify(out)); })
-    .catch(() => {})
+    // Still fails open, but says why.
+    .catch(e => process.stdout.write(JSON.stringify({ systemMessage: `braid: internal error: ${(e && e.message) || e}` })))
     .finally(() => process.exit(0));
 }
 
-module.exports = { gate, projects };
+module.exports = { gate, projects, timeoutFor };

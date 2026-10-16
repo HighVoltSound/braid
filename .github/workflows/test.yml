@@ -4,18 +4,33 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22, 24]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
       - run: npm test
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Needs no login: the validator only reads the manifests.
+      - run: npx --yes @anthropic-ai/claude-code@2.1.301 plugin validate .
+      - run: npx --yes @anthropic-ai/claude-code@2.1.301 plugin validate .claude-plugin/plugin.json
 
   godot:
     runs-on: ubuntu-latest

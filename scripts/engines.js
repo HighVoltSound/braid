@@ -15,8 +15,27 @@ const readJson = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8').repla
 const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 const exists = f => { try { return fs.existsSync(f); } catch { return false; } };
 const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
-// Per-user state, so other users of a shared machine cannot plant or read it.
-const stateFile = (root, ext = 'json') => path.join(os.homedir(), '.cache', 'braid', `${crypto.createHash('sha1').update(path.resolve(root).toLowerCase()).digest('hex').slice(0, 16)}.${ext}`);
+// Per-user state, so other users of a shared machine cannot plant or read it. A relative path is ignored: XDG says
+// so, and the hooks' working folder follows Claude's cd.
+const cacheDir = () => path.resolve((path.isAbsolute(process.env.BRAID_CACHE_DIR || '') && process.env.BRAID_CACHE_DIR)
+  || path.join(path.isAbsolute(process.env.XDG_CACHE_HOME || '') ? process.env.XDG_CACHE_HOME : path.join(os.homedir(), '.cache'), 'braid'));
+const stateFile = (root, ext = 'json') => path.join(cacheDir(), `${crypto.createHash('sha1').update(path.resolve(root).toLowerCase()).digest('hex').slice(0, 16)}.${ext}`);
+// Temp file and rename: a hook of another session never reads half a file.
+function writeAtomic(f, text) {
+  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+  const tmp = `${f}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text);
+    // Windows refuses a rename while another process holds the target for a moment: retry briefly.
+    for (let i = 0; ; i++) {
+      try { fs.renameSync(tmp, f); break; } catch (e) {
+        if (!WIN || i >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1));
+      }
+    }
+  } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+}
+const programFiles = () => [process.env.ProgramFiles || 'C:/Program Files', process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)'];
 const decode = t => t.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 // Files under dir whose name matches re. Callers start inside Source, Content, a plugin's Source/Content,
@@ -57,7 +76,7 @@ function findUnreal(configured, assoc, projectDir) {
       const m = /InstalledDirectory\s+REG_SZ\s+(.+)/.exec(r.stdout || '');
       if (m) candidates.push(m[1].trim());
     }
-    candidates.push(WIN ? `C:/Program Files/Epic Games/UE_${assoc}` : MAC ? `/Users/Shared/Epic Games/UE_${assoc}` : path.join(os.homedir(), `UnrealEngine-${assoc}`));
+    candidates.push(...(WIN ? programFiles().map(p => path.join(p, 'Epic Games', `UE_${assoc}`)) : [MAC ? `/Users/Shared/Epic Games/UE_${assoc}` : path.join(os.homedir(), `UnrealEngine-${assoc}`)]));
   } else if (/^\{?[0-9a-f]{8}-?([0-9a-f]{4}-?){3}[0-9a-f]{12}\}?$/i.test(assoc)) {
     const id = assoc.replace(/^\{?(.*?)\}?$/, '{$1}').toUpperCase();
     if (WIN) {
@@ -197,7 +216,7 @@ function findUnity(configured, version) {
   if (!version) return null;
   const hubConfig = WIN ? path.join(process.env.APPDATA || '', 'UnityHub') : MAC ? path.join(os.homedir(), 'Library', 'Application Support', 'UnityHub') : path.join(os.homedir(), '.config', 'UnityHub');
   const secondary = readJson(path.join(hubConfig, 'secondaryInstallPath.json'));
-  const hubs = [typeof secondary === 'string' && secondary, WIN ? 'C:/Program Files/Unity/Hub/Editor' : MAC ? '/Applications/Unity/Hub/Editor' : path.join(os.homedir(), 'Unity', 'Hub', 'Editor')].filter(Boolean);
+  const hubs = [typeof secondary === 'string' && secondary, ...(WIN ? programFiles().map(p => path.join(p, 'Unity', 'Hub', 'Editor')) : [MAC ? '/Applications/Unity/Hub/Editor' : path.join(os.homedir(), 'Unity', 'Hub', 'Editor')])].filter(Boolean);
   const rel = WIN ? ['Editor', 'Unity.exe'] : MAC ? ['Unity.app', 'Contents', 'MacOS', 'Unity'] : ['Editor', 'Unity'];
   return hubs.map(h => path.join(h, version, ...rel)).find(exists) || null;
 }
@@ -361,10 +380,7 @@ const notInCode = c => /^(MSB|NETSDK|NU)/.test(c) || c === 'CS0006';
 // The inputs as they are now, and the record of a moment Unity's projects were known to match them.
 const inputHashes = root => Object.fromEntries(unityInputs(root).filter(exists).map(f => [relTo(root, f), hash(f)]));
 function writeRecord(file, hashes) {
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, JSON.stringify({ t: Date.now(), hashes }));
-  } catch { /* next time */ }
+  try { writeAtomic(file, JSON.stringify({ t: Date.now(), hashes })); } catch { /* next time */ }
 }
 
 function unityChecks(root, cfg, onPath) {
@@ -381,14 +397,16 @@ function unityChecks(root, cfg, onPath) {
       [/another Unity instance is running with this project open/, open],
     ];
     const base = `${q(unity)} -batchmode -nographics -projectPath ${q(path.resolve(root))} -logFile -`;
-    const results = path.join(os.tmpdir(), `braid-unity-${crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 12)}`);
     const tests = unityTests(root);
     // The inputs are hashed before the run, as Unity is about to see them.
     let seen = null;
     const batch = (check, xml) => Object.assign(check, {
       skip, skipOn,
       prepare: () => {
-        if (xml) fs.rmSync(xml, { force: true }); // a results file left by an earlier run would explain the wrong failure
+        if (xml) {
+          fs.mkdirSync(path.dirname(xml), { recursive: true, mode: 0o700 });
+          fs.rmSync(xml, { force: true }); // a results file left by an earlier run would explain the wrong failure
+        }
         seen = inputHashes(root);
       },
       // Test runs exit 1 on compile errors, 2 on failed tests, so 0 and 2 mean the code compiled.
@@ -399,8 +417,9 @@ function unityChecks(root, cfg, onPath) {
       },
     });
     const testRun = (name, platform, xml) => batch({ name, cmd: `${base} -runTests -testPlatform ${platform} -testResults ${q(xml)}` }, xml);
-    if (tests.edit) checks.push(testRun('unity-tests', 'EditMode', `${results}-edit.xml`));
-    if (tests.play) checks.push(testRun('unity-playmode', 'PlayMode', `${results}-play.xml`));
+    // Results in the per-user state folder: a predictable name in the shared temp folder could be planted.
+    if (tests.edit) checks.push(testRun('unity-tests', 'EditMode', stateFile(root, 'unity-edit.xml')));
+    if (tests.play) checks.push(testRun('unity-playmode', 'PlayMode', stateFile(root, 'unity-play.xml')));
     if (!tests.edit && !tests.play) checks.push(batch({ name: 'unity-compile', cmd: `${base} -quit`, failOn: /error CS\d{4}|Scripts have compiler errors/ }, null));
   } else {
     const ignored = [cfg.unity, process.env.UNITY_BIN].filter(p => p && exists(p));
@@ -455,4 +474,4 @@ function unityChecks(root, cfg, onPath) {
   return checks;
 }
 
-module.exports = { unrealChecks, unityChecks, findUnreal, findUnity, testPrefixes, assetPaths, readJson, stateFile };
+module.exports = { unrealChecks, unityChecks, findUnreal, findUnity, testPrefixes, assetPaths, readJson, stateFile, writeAtomic, programFiles };

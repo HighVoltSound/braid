@@ -8,12 +8,12 @@ const path = require('path');
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'braid-eng-'));
 process.env.HOME = process.env.USERPROFILE = ROOT;
-for (const v of ['CLAUDE_PROJECT_DIR', 'GODOT_BIN', 'GODOT', 'BRAID_GATE', 'UE_ROOT', 'UNITY_BIN']) delete process.env[v];
+for (const v of ['CLAUDE_PROJECT_DIR', 'GODOT_BIN', 'GODOT', 'BRAID_GATE', 'UE_ROOT', 'UNITY_BIN', 'CI', 'GITHUB_ACTIONS', 'CLAUDE_PLUGIN_OPTION_GATE', 'BRAID_CACHE_DIR', 'XDG_CACHE_HOME']) delete process.env[v];
 process.env.TMPDIR = process.env.TEMP = process.env.TMP = ROOT;
 test.after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
 
 const { detect, run, runAfter, config, snapshot } = require('../scripts/checks.js');
-const { findUnreal, findUnity, testPrefixes, assetPaths, unityChecks } = require('../scripts/engines.js');
+const { findUnreal, findUnity, testPrefixes, assetPaths, unityChecks, stateFile } = require('../scripts/engines.js');
 const { gate } = require('../hooks/gate.js');
 
 const WIN = process.platform === 'win32';
@@ -62,6 +62,31 @@ test('findUnity: a configured or UNITY_BIN editor of another version is never us
   process.env.UNITY_BIN = other;
   try { assert.notStrictEqual(findUnity(undefined, '6000.3.22f1'), other); } finally { delete process.env.UNITY_BIN; }
   assert.strictEqual(findUnity(other, '2022.3.10f1'), other);
+});
+
+test('findUnity, findUnreal: Program Files comes from the environment', { skip: !WIN && 'Windows only' }, () => {
+  const pf = tmp();
+  const exe = path.join(pf, 'Unity', 'Hub', 'Editor', '1.2.3f1', 'Editor', 'Unity.exe');
+  write(path.dirname(exe), 'Unity.exe', '');
+  const ue = path.join(pf, 'Epic Games', 'UE_9.4');
+  write(ue, 'Engine/Build/Build.version', JSON.stringify({ MajorVersion: 9, MinorVersion: 4 }));
+  const old = process.env.ProgramFiles;
+  process.env.ProgramFiles = pf;
+  try {
+    assert.strictEqual(findUnity(undefined, '1.2.3f1'), exe);
+    assert.strictEqual(findUnreal(undefined, '9.4', tmp()), ue);
+  } finally { process.env.ProgramFiles = old; }
+});
+
+test('stateFile: BRAID_CACHE_DIR, else an absolute XDG_CACHE_HOME, else ~/.cache', () => {
+  const at = () => path.dirname(stateFile(tmp()));
+  assert.strictEqual(at(), path.join(ROOT, '.cache', 'braid'));
+  process.env.XDG_CACHE_HOME = 'relative/cache';
+  assert.strictEqual(at(), path.join(ROOT, '.cache', 'braid'), 'a relative XDG path is ignored');
+  process.env.XDG_CACHE_HOME = path.join(ROOT, 'xdg');
+  assert.strictEqual(at(), path.join(ROOT, 'xdg', 'braid'));
+  process.env.BRAID_CACHE_DIR = path.join(ROOT, 'mine');
+  try { assert.strictEqual(at(), path.join(ROOT, 'mine')); } finally { delete process.env.XDG_CACHE_HOME; delete process.env.BRAID_CACHE_DIR; }
 });
 
 test('unreal: plugins are found at any depth and mounted by their .uplugin name', () => {
@@ -360,6 +385,8 @@ test('unity: a failure shows the compile errors once each, or the failed tests f
   const err = "Assets\\My Scripts\\Calc.cs(1,67): error CS0103: The name 'Foo' does not exist in the current context";
   assert.match(failed(`-r:"x.dll"\n${err}\n/nowarn:0169\n${err}\nScripts have compiler errors.`), /1 compile error\(s\):\nAssets\\My Scripts\\Calc\.cs\(1,67\): error CS0103/);
   const xml = check.cmd.match(/-testResults "([^"]+)"/)[1];
+  assert.strictEqual(path.dirname(xml), path.join(ROOT, '.cache', 'braid'), 'per user, not in the shared temp folder');
+  fs.mkdirSync(path.dirname(xml), { recursive: true });
   fs.writeFileSync(xml, '<test-run><test-case id="1" fullname="Ok.Skipped" result="Skipped" />' +
     '<test-case id="2" fullname="CalcTests.Adds(&quot;a&quot;)" result="Failed"><failure><message><![CDATA[  Expected: "&lt;b&gt;"\n  But was:  5\n]]></message>' +
     `<stack-trace><![CDATA[at NUnit.Framework.Assert.That () [0x00001]\nat Dict.get_Item (TKey key) [0x0001e] in <88e4733ac7bc4ae1b496735e6b83bbd3>:0\nat Lib.F () in /Users/bokken/build/Lib.cs:3\nat CalcTests.Adds () [0x00001] in ${path.join(d, 'Assets', 'Tests', 'CalcTests.cs')}:5\n]]></stack-trace></failure></test-case>` +

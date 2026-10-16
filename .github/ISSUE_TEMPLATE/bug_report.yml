@@ -1,0 +1,100 @@
+name: Bug report
+description: braid did something wrong, or nothing at all.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A security problem? Do not file it here: see [SECURITY.md](https://github.com/HighVoltSound/braid/blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what braid did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest project or steps that show it.
+      placeholder: |
+        1. Create a Godot 4.7 project with ...
+        2. Ask Claude to ...
+        3. The stop hook ...
+    validations:
+      required: true
+  - type: textarea
+    id: hook-output
+    attributes:
+      label: Hook output
+      description: The "braid gate:" or "braid autopilot:" message, the braid report, and the output of `node <plugin>/scripts/checks.js <project> --list`. Remove anything private.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: braid-version
+    attributes:
+      label: braid version
+      description: Shown in `/plugin` on the Installed tab.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: claude-code-version
+    attributes:
+      label: Claude Code version
+      description: "`claude --version`"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Windows 11, macOS 15, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      description: "`node --version`"
+  - type: dropdown
+    id: stack
+    attributes:
+      label: Stack
+      multiple: true
+      options:
+        - JavaScript / TypeScript
+        - Deno
+        - Python
+        - Rust
+        - Go
+        - .NET
+        - Java / Kotlin
+        - Swift
+        - Dart / Flutter
+        - Elixir
+        - Ruby
+        - PHP
+        - Godot
+        - Unreal Engine
+        - Unity
+        - Other (checks in .claude/braid.json)
+    validations:
+      required: true
+  - type: input
+    id: stack-version
+    attributes:
+      label: Engine or tool versions
+      description: For example Godot 4.7.2, Unreal 5.8, Unity 6000.3, TypeScript 5.9.
+  - type: dropdown
+    id: gate
+    attributes:
+      label: Gate mode
+      options:
+        - auto (default)
+        - fast
+        - all
+        - "off"
+        - not sure

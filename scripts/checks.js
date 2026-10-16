@@ -7,11 +7,13 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
-const { unrealChecks, unityChecks, readJson, stateFile } = require('./engines.js');
+const { unrealChecks, unityChecks, readJson, stateFile, writeAtomic, programFiles } = require('./engines.js');
 
 const WIN = process.platform === 'win32';
 const TIMEOUT_MS = Number(process.env.BRAID_TIMEOUT || 600) * 1000;
 const TAIL_LINES = 40;
+// Windows runs a command found in the current folder before PATH: a repo could plant npm.cmd or godot.exe.
+const SAFE_ENV = WIN ? { NoDefaultCurrentDirectoryInExePath: '1' } : {};
 // Checks cheap enough for the stop gate; tests and builds run in the /braid loop.
 // An incremental Unreal build and a dotnet build of Unity's generated projects take seconds and catch compile
 // errors, so they count as fast (unity-scripts SKIPs where those projects are out of date).
@@ -70,7 +72,7 @@ function found(root, cfg) {
   if (!unreal && !unity && entries.some(f => /\.(sln|csproj)$/.test(f))) add('dotnet', 'dotnet test --nologo');
   if (unreal) checks.push(...unrealChecks(root, cfg, unreal));
   if (unity) checks.push(...unityChecks(root, cfg, onPath));
-  if (has('gradlew') || has('gradlew.bat')) add('test', WIN ? 'gradlew.bat test --quiet' : './gradlew test --quiet');
+  if (has('gradlew') || has('gradlew.bat')) add('test', WIN ? '.\\gradlew.bat test --quiet' : './gradlew test --quiet');
   else if (has('pom.xml')) add('test', 'mvn -q test');
   if (has('Package.swift')) add('test', 'swift test');
   if (has('pubspec.yaml')) { const flutter = read('pubspec.yaml').includes('flutter:'); add('lint', `${flutter ? 'flutter' : 'dart'} analyze`); if (has('test')) add('test', `${flutter ? 'flutter' : 'dart'} test`); }
@@ -139,7 +141,7 @@ function findGodot(configured, want = {}) {
   for (const name of ['godot', 'godot4']) { const p = onPath(name); if (p) return consoleTwin(p); }
   const home = os.homedir();
   const roots = [path.join(home, 'Downloads'), path.join(home, 'Desktop'), path.join(home, 'Documents'),
-    'C:/Program Files', 'C:/Program Files/Godot', path.join(home, 'Applications'), '/Applications'];
+    ...(WIN ? programFiles().flatMap(p => [p, path.join(p, 'Godot')]) : []), path.join(home, 'Applications'), '/Applications'];
   const found = [];
   const look = (dir, depth) => {
     let entries = [];
@@ -161,7 +163,8 @@ function findGodot(configured, want = {}) {
 }
 
 function onPath(cmd) {
-  const r = spawnSync(WIN ? 'where' : 'which', [cmd], { encoding: 'utf8' });
+  // where ignores NoDefaultCurrentDirectoryInExePath; its $PATH: form leaves the current folder out.
+  const r = spawnSync(WIN ? 'where' : 'which', [WIN ? `$PATH:${cmd}` : cmd], { encoding: 'utf8', env: { ...process.env, ...SAFE_ENV } });
   return r.status === 0 ? r.stdout.split(/\r?\n/)[0].trim() : null;
 }
 
@@ -170,6 +173,9 @@ function onPath(cmd) {
 // SKIP (ok, with a reason) means the check could not run for a reason outside the code:
 // check.skip beforehand, check.prepare() returning a reason, or a failure whose output matches check.skipOn.
 // check.after(result) may then replace the result: judge it further, or boil a long log down to its cause.
+// The checks running now, so a hook that is being killed can take them with it.
+const active = new Set();
+const killActive = () => { for (const c of active) killTree(c); };
 function run(check, root) {
   const skipped = reason => Promise.resolve({ ok: true, skipped: reason, out: reason, secs: 0 });
   if (check.skip) return skipped(check.skip);
@@ -181,7 +187,8 @@ function run(check, root) {
   const start = Date.now();
   return new Promise(resolve => {
     // Its own process group on Unix, so a kill reaches the real process and not just the shell.
-    const child = spawn(check.cmd, { cwd: root, shell: true, detached: !WIN, env: { ...process.env, CI: '1' }, windowsHide: true });
+    const child = spawn(check.cmd, { cwd: root, shell: true, detached: !WIN, env: { ...process.env, CI: '1', ...SAFE_ENV }, windowsHide: true });
+    active.add(child);
     let out = '';
     let note = '';
     let killTimer = null;
@@ -190,6 +197,7 @@ function run(check, root) {
     const finish = status => {
       if (done) return;
       done = true;
+      active.delete(child);
       clearTimeout(timer);
       clearTimeout(killTimer);
       const secs = (Date.now() - start) / 1000;
@@ -266,17 +274,10 @@ function fingerprint(root, snap = snapshot(root)) {
 }
 
 const readState = root => readJson(stateFile(root)) || {};
-function writeState(root, state) {
-  const f = stateFile(root);
-  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(f, JSON.stringify(state));
-}
+const writeState = (root, state) => writeAtomic(stateFile(root), JSON.stringify(state));
 // A snapshot saved for the stop hook's per-file change list; bigger projects get none.
 const MAX_SNAP = 5000;
-function writeSnap(f, snap) {
-  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(f, Object.keys(snap).length <= MAX_SNAP ? JSON.stringify(snap) : 'null');
-}
+const writeSnap = (f, snap) => writeAtomic(f, Object.keys(snap).length <= MAX_SNAP ? JSON.stringify(snap) : 'null');
 // The files as of the last --reviewed, so the stop hook can tell which listed files a review has covered.
 const reviewedFile = root => stateFile(root).replace(/\.json$/, '.reviewed.snap.json');
 
@@ -331,6 +332,10 @@ function runAfter(check, root, results) {
   return run(check, root);
 }
 
-if (require.main === module) main().then(code => process.exit(code));
+if (require.main === module) {
+  // Interrupted (a tool timeout, Ctrl+C): the checks it started go too, or they hold locks and ports.
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { killActive(); process.exit(1); });
+  main().then(code => process.exit(code));
+}
 
-module.exports = { detect, run, runAfter, report, findGodot, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST };
+module.exports = { detect, run, runAfter, killActive, report, findGodot, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST };
