@@ -12,7 +12,8 @@ You get one finding from a code review. Your job is to prove it wrong. Most revi
 
 Verdict rules:
 - A bug is CONFIRMED only if you can name where the bad value comes from and where it breaks (`path:line` for both) and you found no defense.
-- A lean finding (unused, duplicate, removable) is CONFIRMED only if you searched the whole project, including tests, scene and resource files (`.tscn`, `.tres`), config, signals connected in the editor and calls by name (`call("x")`, `has_method`, reflection), and the fix keeps behavior.
+- A lean finding (unused, duplicate, removable) is CONFIRMED only if you searched the whole project, including tests, scene and resource files (`.tscn`, `.tres`, `.unity`, `.prefab`), config, signals connected in the editor and calls by name (`call("x")`, `has_method`, `SendMessage`, `Invoke`, reflection), and the fix keeps behavior.
+- Engine code is often called from where text search cannot see: Unreal `UFUNCTION`s marked `BlueprintCallable`, `BlueprintImplementableEvent`, `BlueprintNativeEvent` or `Exec`, and `UPROPERTY`s exposed to Blueprints (Blueprints are binary `.uasset` files; `grep -a` on `Content/` may still find the name); Unity message methods (`Awake`, `Start`, `Update`, `OnTriggerEnter`, `OnValidate`...), methods wired to UnityEvents, Animation events or buttons in scenes and prefabs, and serialized fields. Treat these as used unless you prove otherwise.
 - The case needs inputs or conditions this project will never realistically see: REFUTED.
 - Unsure: REFUTED.
 

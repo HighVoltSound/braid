@@ -1,33 +1,40 @@
 #!/usr/bin/env node
 // Finds and runs a project's real checks: types, lint, tests, build.
-// Usage: node checks.js [dir] [--list] [--fast] [--reviewed]   Exit: 0 all green, 1 something failed, 3 no checks found.
+// Usage: node checks.js [dir] [--list] [--fast] [--reviewed]   Exit: 0 nothing failed (SKIPs are listed), 1 something failed, 3 no checks found.
 'use strict';
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
+const { unrealChecks, unityChecks, readJson, stateFile } = require('./engines.js');
 
 const WIN = process.platform === 'win32';
 const TIMEOUT_MS = Number(process.env.BRAID_TIMEOUT || 600) * 1000;
 const TAIL_LINES = 40;
 // Checks cheap enough for the stop gate; tests and builds run in the /braid loop.
-const FAST = /^(types|typecheck|type-check|lint|vet|gdlint|godot-import|godot-scripts)$/;
+// An incremental Unreal build and a dotnet build of Unity's generated projects take seconds and catch compile
+// errors, so they count as fast (unity-scripts SKIPs where those projects are out of date).
+const FAST = /^(types|typecheck|type-check|lint|vet|gdlint|godot-import|godot-scripts|unreal-build|unity-scripts)$/;
 // Godot exits 0 on most script errors, so failures are read from its output.
 // Engine noise printed at shutdown is not a failure of the code.
 const GODOT_FAIL = /SCRIPT ERROR|Parse Error|Compile Error|Failed to load script|^ERROR:(?!.*(Unreferenced static string|RID allocations|leaked at exit|still in use at exit|PagedAllocator))/m;
-const CODE = /\.(gd|gdshader|gdshaderinc|tscn|tres|cs|fs|csproj|fsproj|js|jsx|mjs|cjs|ts|tsx|mts|cts|vue|svelte|py|pyi|rs|go|java|kt|kts|scala|c|cc|cpp|h|hpp|m|mm|rb|php|swift|dart|ex|exs|zig|hs|ml|lua|sql)$|(^|\/)(project\.godot|package\.json|tsconfig[^/]*\.json|deno\.jsonc?|pyproject\.toml|Cargo\.toml|go\.mod|pom\.xml|build\.gradle|Package\.swift|pubspec\.yaml|mix\.exs|Gemfile|composer\.json|Makefile|CMakeLists\.txt)$/;
+const CODE = /\.(gd|gdshader|gdshaderinc|tscn|tres|cs|fs|csproj|fsproj|js|jsx|mjs|cjs|ts|tsx|mts|cts|vue|svelte|py|pyi|rs|go|java|kt|kts|scala|c|cc|cpp|h|hpp|inl|m|mm|rb|php|swift|dart|ex|exs|zig|hs|ml|lua|sql|uproject|uplugin|asmdef|asmref|unity|prefab|shader|cginc|compute|hlsl|usf|ush)$|(^|\/)(project\.godot|package\.json|tsconfig[^/]*\.json|deno\.jsonc?|pyproject\.toml|Cargo\.toml|go\.mod|pom\.xml|build\.gradle|Package\.swift|pubspec\.yaml|mix\.exs|Gemfile|composer\.json|Makefile|CMakeLists\.txt|Packages\/manifest\.json|csc\.rsp)$|(^|\/)Config\/([^/]+\/)?[^/]+\.ini$/;
 
-const readJson = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 const config = root => readJson(path.join(root, '.claude', 'braid.json')) || {};
 
+// The project's checks: from .claude/braid.json "checks" if set, else detected; minus "skip".
 function detect(root) {
+  const cfg = config(root);
+  const all = cfg.checks ? Object.entries(cfg.checks).map(([name, cmd]) => ({ name, cmd })) : found(root, cfg);
+  const skip = new Set(Array.isArray(cfg.skip) ? cfg.skip : []);
+  return all.filter(c => !skip.has(c.name));
+}
+
+function found(root, cfg) {
   const has = f => fs.existsSync(path.join(root, f));
   const read = f => { try { return fs.readFileSync(path.join(root, f), 'utf8'); } catch { return ''; } };
   const q = p => `"${p}"`;
-  const cfg = config(root);
-  if (cfg.checks) return Object.entries(cfg.checks).map(([name, cmd]) => ({ name, cmd }));
-
   const entries = (() => { try { return fs.readdirSync(root); } catch { return []; } })();
   const checks = [];
   const add = (name, cmd, failOn) => checks.push({ name, cmd, failOn });
@@ -57,7 +64,12 @@ function detect(root) {
 
   if (has('Cargo.toml')) { if (onPath('cargo-clippy')) add('clippy', 'cargo clippy --all-targets --quiet'); add('test', 'cargo test --quiet'); }
   if (has('go.mod')) { add('vet', 'go vet ./...'); add('test', 'go test ./...'); }
-  if (entries.some(f => /\.(sln|csproj)$/.test(f))) add('dotnet', 'dotnet test --nologo');
+  // Unreal and Unity generate a .sln too, but it is not a .NET project: they get their own checks.
+  const unreal = entries.find(f => /\.uproject$/i.test(f));
+  const unity = has('ProjectSettings/ProjectVersion.txt');
+  if (!unreal && !unity && entries.some(f => /\.(sln|csproj)$/.test(f))) add('dotnet', 'dotnet test --nologo');
+  if (unreal) checks.push(...unrealChecks(root, cfg, unreal));
+  if (unity) checks.push(...unityChecks(root, cfg, onPath));
   if (has('gradlew') || has('gradlew.bat')) add('test', WIN ? 'gradlew.bat test --quiet' : './gradlew test --quiet');
   else if (has('pom.xml')) add('test', 'mvn -q test');
   if (has('Package.swift')) add('test', 'swift test');
@@ -78,7 +90,7 @@ function detect(root) {
       const mono = pg.includes('"C#"') || entries.some(f => /\.csproj$/.test(f));
       const godot = findGodot(cfg.godot, { version, mono });
       if (!godot) {
-        checks.push({ name: 'godot-import', missing: `Godot ${mono ? '.NET ' : ''}binary not found: set GODOT_BIN or "godot" in .claude/braid.json` });
+        checks.push({ name: 'godot-import', skip: `Godot ${mono ? '.NET ' : ''}binary not found: set GODOT_BIN or "godot" in .claude/braid.json` });
       } else {
         const run = `${q(godot)} --headless --no-header --path ${q(root)}`;
         // Import refreshes the class_name cache the other checks compile against.
@@ -155,8 +167,17 @@ function onPath(cmd) {
 
 // Runs one check. A check with failOn is killed as soon as its output shows a failure,
 // because a Godot script that errors before quit() would otherwise hang until the timeout.
+// SKIP (ok, with a reason) means the check could not run for a reason outside the code:
+// check.skip beforehand, check.prepare() returning a reason, or a failure whose output matches check.skipOn.
+// check.after(result) may then replace the result: judge it further, or boil a long log down to its cause.
 function run(check, root) {
-  if (check.missing) return Promise.resolve({ ok: false, out: check.missing, secs: 0 });
+  const skipped = reason => Promise.resolve({ ok: true, skipped: reason, out: reason, secs: 0 });
+  if (check.skip) return skipped(check.skip);
+  if (check.prepare) {
+    let reason = null;
+    try { reason = check.prepare(); } catch (e) { return Promise.resolve({ ok: false, out: `could not prepare ${check.name}: ${e.message}`, secs: 0 }); }
+    if (reason) return skipped(reason);
+  }
   const start = Date.now();
   return new Promise(resolve => {
     // Its own process group on Unix, so a kill reaches the real process and not just the shell.
@@ -171,8 +192,12 @@ function run(check, root) {
       done = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      const secs = (Date.now() - start) / 1000;
       const ok = (check.okCodes || [0]).includes(status) && !note && !(check.failOn && check.failOn.test(out));
-      resolve({ ok, timedOut, out: note ? `${out}\n${note}` : out, secs: (Date.now() - start) / 1000, status });
+      const skip = !ok && !timedOut && (check.skipOn || []).find(([re]) => re.test(out));
+      let r = skip ? { ok: true, skipped: skip[1], out, secs, status } : { ok, timedOut, out: note ? `${out}\n${note}` : out, secs, status };
+      if (check.after) try { r = check.after(r) || r; } catch { /* keep the result */ }
+      resolve(r);
     };
     const kill = msg => {
       note = msg;
@@ -204,20 +229,28 @@ function snapshot(root) {
   let files = [];
   // -z: git quotes non-ASCII paths otherwise, and those would drop out.
   const git = spawnSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const isUnity = d => fs.existsSync(path.join(root, d, 'ProjectSettings', 'ProjectVersion.txt'));
   if (git.status === 0) files = git.stdout.split('\0').filter(f => CODE.test(f));
   else {
-    const skip = /^(\..*|node_modules|build|dist|target|out|bin|obj|__pycache__|venv|addons)$/;
+    // Dependencies, build output, and Unreal's caches (Intermediate holds generated C++).
+    const skip = /^(\..*|node_modules|build|dist|target|out|bin|obj|__pycache__|venv|site-packages|addons|Binaries|Intermediate|Saved|DerivedDataCache)$/;
+    // Unity's caches, only next to its ProjectSettings: elsewhere these names can hold real code.
+    const unityCache = /^(Library|Temp|Logs|UserSettings)$/;
     const walk = rel => {
       let entries = [];
       try { entries = fs.readdirSync(path.join(root, rel), { withFileTypes: true }); } catch { return; }
+      const unityDir = isUnity(rel);
       for (const e of entries) {
         if (files.length > 20000) return;
         const r = rel ? `${rel}/${e.name}` : e.name;
-        if (e.isDirectory()) { if (!skip.test(e.name)) walk(r); } else if (CODE.test(r)) files.push(r);
+        if (!e.isDirectory()) { if (CODE.test(r)) files.push(r); }
+        else if (!skip.test(e.name) && !(unityDir && unityCache.test(e.name))) walk(r);
       }
     };
     walk('');
   }
+  // Unity rewrites the *.csproj next to its ProjectSettings on every refresh: generated, like Library.
+  files = files.filter(f => !(f.endsWith('.csproj') && isUnity(path.dirname(f))));
   const snap = {};
   for (const f of files.sort()) {
     try { const s = fs.statSync(path.join(root, f)); snap[f] = `${s.size}:${s.mtimeMs}`; } catch { /* deleted */ }
@@ -232,16 +265,23 @@ function fingerprint(root, snap = snapshot(root)) {
   return h.digest('hex');
 }
 
-// Per-user state, so other users of a shared machine cannot plant or read it.
-const stateFile = root => path.join(os.homedir(), '.cache', 'braid', `${crypto.createHash('sha1').update(path.resolve(root).toLowerCase()).digest('hex').slice(0, 16)}.json`);
 const readState = root => readJson(stateFile(root)) || {};
 function writeState(root, state) {
   const f = stateFile(root);
   fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
   fs.writeFileSync(f, JSON.stringify(state));
 }
+// A snapshot saved for the stop hook's per-file change list; bigger projects get none.
+const MAX_SNAP = 5000;
+function writeSnap(f, snap) {
+  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(f, Object.keys(snap).length <= MAX_SNAP ? JSON.stringify(snap) : 'null');
+}
+// The files as of the last --reviewed, so the stop hook can tell which listed files a review has covered.
+const reviewedFile = root => stateFile(root).replace(/\.json$/, '.reviewed.snap.json');
 
 function report(name, cmd, r) {
+  if (r.skipped) return `SKIP ${name}: ${r.skipped}`;
   const s = `${r.ok ? 'PASS' : 'FAIL'} ${name} (${r.secs.toFixed(1)}s)${cmd ? `  $ ${cmd}` : ''}`;
   if (r.ok) return s;
   // Drop colors and progress bars (Godot prints many), keep the tail where the errors are.
@@ -253,24 +293,44 @@ async function main() {
   const args = process.argv.slice(2);
   const root = path.resolve(args.find(a => !a.startsWith('--')) || process.cwd());
   // End of a /braid loop: the stop gate will not ask for another review of this exact code.
-  if (args.includes('--reviewed')) { writeState(root, { ...readState(root), reviewed: fingerprint(root) }); console.log('braid: marked as reviewed'); return 0; }
+  if (args.includes('--reviewed')) {
+    const snap = snapshot(root);
+    writeState(root, { ...readState(root), reviewed: fingerprint(root, snap) });
+    writeSnap(reviewedFile(root), snap);
+    console.log('braid: marked as reviewed');
+    return 0;
+  }
   const fast = args.includes('--fast');
-  const checks = detect(root).filter(c => !fast || FAST.test(c.name));
-  if (!checks.length) { console.log('braid checks: none found (add "checks" to .claude/braid.json)'); return 3; }
-  if (args.includes('--list')) { for (const c of checks) console.log(`${c.name}: ${c.cmd || c.missing}`); return 0; }
+  const all = detect(root);
+  const checks = all.filter(c => !fast || FAST.test(c.name));
+  if (!checks.length) { console.log(fast && all.length ? "braid checks: none of this project's checks is fast (run without --fast)" : 'braid checks: none found (add "checks" to .claude/braid.json)'); return 3; }
+  if (args.includes('--list')) { for (const c of checks) console.log(`${c.name}: ${c.skip ? `SKIP ${c.skip}` : c.cmd}`); return 0; }
   const fp = fingerprint(root);
+  const results = {};
   let failed = 0;
+  let skipped = 0;
   for (const c of checks) {
-    const r = await run(c, root);
+    const r = await runAfter(c, root, results);
+    results[c.name] = r;
     if (!r.ok) failed++;
+    if (r.skipped) skipped++;
     console.log(report(c.name, c.cmd, r));
   }
-  console.log(`braid checks: ${checks.length - failed} passed, ${failed} failed`);
-  // A green run of everything lets the stop gate skip re-checking the same code.
-  if (!failed && !fast && fp === fingerprint(root)) writeState(root, { ...readState(root), green: fp });
+  console.log(`braid checks: ${checks.length - failed - skipped} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}`);
+  // A full green run lets the stop gate skip re-checking the same code.
+  if (!failed && !skipped && !fast && fp === fingerprint(root)) writeState(root, { ...readState(root), green: fp });
+  // A failure disproves an earlier green of the same code (one whose inputs the fingerprint cannot see).
+  else if (failed && !fast && readState(root).green === fp) { const { green, ...rest } = readState(root); writeState(root, rest); }
   return failed ? 1 : 0;
+}
+
+// A check that needs another one (Unreal tests need a fresh build) is skipped when that one did not pass.
+function runAfter(check, root, results) {
+  const dep = check.needs && results[check.needs];
+  if (dep && (!dep.ok || dep.skipped)) return Promise.resolve({ ok: true, skipped: `needs ${check.needs} to pass first`, out: '', secs: 0 });
+  return run(check, root);
 }
 
 if (require.main === module) main().then(code => process.exit(code));
 
-module.exports = { detect, run, report, findGodot, snapshot, fingerprint, stateFile, readState, writeState, config, FAST };
+module.exports = { detect, run, runAfter, report, findGodot, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST };

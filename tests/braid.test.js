@@ -12,7 +12,7 @@ process.env.HOME = process.env.USERPROFILE = ROOT;
 for (const v of ['CLAUDE_PROJECT_DIR', 'GODOT_BIN', 'GODOT', 'BRAID_GATE']) delete process.env[v];
 test.after(() => fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5 }));
 
-const { detect, run, fingerprint, findGodot } = require('../scripts/checks.js');
+const { detect, run, snapshot, fingerprint, findGodot, readState, writeState } = require('../scripts/checks.js');
 const { gate, projects } = require('../hooks/gate.js');
 
 const WIN = process.platform === 'win32';
@@ -61,12 +61,29 @@ test('detect: other stacks by their project files', () => {
   }
 });
 
+test('detect: engines generate a .sln that is not a .NET test project', () => {
+  for (const marker of ['Game.uproject', 'ProjectSettings/ProjectVersion.txt']) {
+    const d = tmp();
+    write(d, marker, marker.endsWith('.uproject') ? '{"EngineAssociation": "9.9"}' : 'm_EditorVersion: 1.0.0f1\n');
+    write(d, 'Game.sln', '');
+    const checks = detect(d);
+    assert.ok(checks.length && !checks.some(c => c.name === 'dotnet'), JSON.stringify(checks));
+  }
+});
+
 test('detect: python uses the locked environment runner', () => {
   const d = tmp();
   write(d, 'pyproject.toml', '[tool.pytest.ini_options]\n[tool.mypy]\n');
   write(d, 'uv.lock', '');
   const cmds = detect(d).map(c => c.cmd);
   assert.ok(cmds.includes('uv run pytest -q') && cmds.includes('uv run mypy .'), cmds.join(' | '));
+});
+
+test('detect: "skip" in config drops checks by name', () => {
+  const d = tmp();
+  write(d, 'package.json', JSON.stringify({ scripts: { lint: 'eslint .', test: 'jest' } }));
+  cfg(d, undefined, { skip: ['lint'] });
+  assert.deepStrictEqual(detect(d).map(c => c.cmd), ['npm run test']);
 });
 
 test('detect: config checks replace detection', () => {
@@ -135,6 +152,44 @@ test('fingerprint: changes when code changes, ignores docs', () => {
   assert.notStrictEqual(fingerprint(d), a);
 });
 
+test('snapshot: folders named like engine caches are still walked in other projects', () => {
+  const d = tmp();
+  write(d, 'Sol.sln', '');
+  write(d, 'Library/Parser.cs', 'class P {}\n');
+  write(d, 'src/Library/Lib.fs', 'module Lib\n');
+  write(d, 'scenes/Content/inv.gd', 'extends Node\n');
+  const files = Object.keys(snapshot(d));
+  for (const f of ['Library/Parser.cs', 'src/Library/Lib.fs', 'scenes/Content/inv.gd']) assert.ok(files.includes(f), `${f} missing from ${files}`);
+});
+
+test('snapshot: Unity and Unreal caches are skipped, their source is not', () => {
+  const u = tmp();
+  write(u, 'ProjectSettings/ProjectVersion.txt', 'm_EditorVersion: 6000.3.22f1\n');
+  write(u, 'Library/Bee/gen.cs', '');
+  write(u, 'Assets/Scripts/Player.cs', '');
+  write(u, 'Assets/Library/Inv.cs', '');
+  assert.deepStrictEqual(Object.keys(snapshot(u)), ['Assets/Library/Inv.cs', 'Assets/Scripts/Player.cs']);
+  // A Unity project inside another project keeps its caches out too.
+  const outer = tmp();
+  write(outer, 'package.json', '{}');
+  write(outer, 'game/ProjectSettings/ProjectVersion.txt', 'm_EditorVersion: 6000.3.22f1\n');
+  write(outer, 'game/Library/PackageCache/x.cs', '');
+  write(outer, 'game/Assets/P.cs', '');
+  assert.deepStrictEqual(Object.keys(snapshot(outer)), ['game/Assets/P.cs', 'package.json']);
+  // Unreal: Intermediate is a cache; scripts under Content (Python, UnLua) are code; pip packages are not.
+  const r = tmp();
+  write(r, 'Game.uproject', '{}');
+  write(r, 'Intermediate/Build/x.generated.h', '');
+  write(r, 'Content/Script/Player.lua', '');
+  write(r, 'Content/Python/init_unreal.py', '');
+  write(r, 'Content/Python/Lib/site-packages/dep/x.py', '');
+  write(r, 'Plugins/Tool/Tool.uplugin', '{}');
+  write(r, 'Plugins/Tool/Content/a.py', '');
+  write(r, 'Source/Game/Game.cpp', '');
+  write(r, 'Config/Windows/WindowsEngine.ini', '');
+  assert.deepStrictEqual(Object.keys(snapshot(r)).sort(), ['Config/Windows/WindowsEngine.ini', 'Content/Python/init_unreal.py', 'Content/Script/Player.lua', 'Game.uproject', 'Plugins/Tool/Content/a.py', 'Plugins/Tool/Tool.uplugin', 'Source/Game/Game.cpp']);
+});
+
 test('fingerprint: sees non-ASCII paths in a git repo', { skip: spawnSync('git', ['--version']).status !== 0 && 'no git' }, () => {
   const d = tmp();
   spawnSync('git', ['init', '-q'], { cwd: d });
@@ -148,7 +203,9 @@ test('projects: finds projects one level down', () => {
   const d = tmp();
   write(d, 'game/package.json', JSON.stringify({ scripts: { lint: 'x' } }));
   write(d, 'notes/a.md', 'x');
-  assert.deepStrictEqual(projects(d), [path.join(d, 'game')]);
+  write(d, 'unity/ProjectSettings/ProjectVersion.txt', 'm_EditorVersion: 6000.3.22f1\n');
+  write(d, 'unreal/Game.uproject', '{}');
+  assert.deepStrictEqual(projects(d).sort(), ['game', 'unity', 'unreal'].map(p => path.join(d, p)));
 });
 
 test('gate: silent when code is unchanged, blocks on a failing check, then lets go', async () => {
@@ -367,6 +424,16 @@ test('auto: failing checks come first, the review request after they pass', asyn
   assert.match((await gate('stop', input)).reason, /braid autopilot/);
 });
 
+test('checks.js: a full run that fails takes back the green mark of that code', () => {
+  const d = tmp();
+  write(d, 'main.js', 'bad\n');
+  cfg(d, { lint: lintBad });
+  writeState(d, { green: fingerprint(d) });
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'checks.js'), d], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 1, r.stdout);
+  assert.strictEqual(readState(d).green, undefined);
+});
+
 test('auto: code already marked reviewed by checks.js --reviewed is not asked again', async () => {
   const d = tmp();
   write(d, 'main.js', 'ok\n');
@@ -377,6 +444,46 @@ test('auto: code already marked reviewed by checks.js --reviewed is not asked ag
   const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'checks.js'), d, '--reviewed'], { encoding: 'utf8' });
   assert.strictEqual(r.status, 0, r.stderr);
   assert.strictEqual(await gate('stop', input), null);
+});
+
+const reviewed = d => {
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'checks.js'), d, '--reviewed'], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, r.stderr);
+};
+
+test('auto: a second request in a turn the user did not end leaves out what the first one got reviewed', async () => {
+  const d = tmp();
+  for (const f of ['a.js', 'b.js', 'c.js']) write(d, f, '1\n');
+  write(d, 'package.json', '{}');
+  const input = { cwd: d, session_id: 'a3b' };
+  await gate('turn', input);
+  write(d, 'a.js', '2\n');
+  fs.rmSync(path.join(d, 'c.js'));
+  assert.ok((await gate('stop', input)).reason.includes(`${d}: a.js, c.js (deleted).`));
+  reviewed(d);
+  write(d, 'b.js', '2\n');
+  await gate('turn', input); // the user wrote while Claude was still working
+  const out = await gate('stop', input);
+  assert.ok(out.reason.includes(`${d}: b.js.`), out.reason);
+});
+
+test('auto: a --reviewed covers only files a request listed, never another session\'s or a later deletion', async () => {
+  const d = tmp();
+  for (const f of ['a.js', 'b.js']) write(d, f, '1\n');
+  write(d, 'package.json', '{}');
+  reviewed(d);
+  write(d, 'x.js', 'made by the user after that review\n');
+  const a = { cwd: d, session_id: 'a3c' };
+  const b = { cwd: d, session_id: 'a3d' };
+  await gate('turn', a);
+  await gate('turn', b);
+  write(d, 'b.js', '2\n');
+  fs.rmSync(path.join(d, 'x.js'));
+  assert.ok((await gate('stop', a)).reason.includes('x.js (deleted)'));
+  reviewed(d);
+  write(d, 'a.js', '2\n');
+  const out = await gate('stop', b);
+  assert.ok(out.reason.includes('b.js') && out.reason.includes('x.js (deleted)'), out.reason);
 });
 
 test('start: hands over the ladder unless ponytail is enabled', async () => {
@@ -393,7 +500,7 @@ test('gate: a missing Godot binary does not block', async () => {
   write(d, 'project.godot', 'config_version=5\n');
   write(d, 'main.gd', 'extends Node\n');
   cfg(d, undefined, { gate: 'fast' });
-  if (detect(d).some(c => !c.missing && c.name === 'godot-import')) return; // a real Godot is on PATH
+  if (detect(d).some(c => !c.skip && c.name === 'godot-import')) return; // a real Godot is on PATH
   const input = { cwd: d, session_id: 's6' };
   await gate('turn', input);
   write(d, 'main.gd', 'extends Node2D\n');

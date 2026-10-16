@@ -4,7 +4,7 @@ description: >
   Code autopilot: does the task with the smallest change, then runs the
   project's real checks, gets a fresh-eyes review, tries to refute every
   finding, fixes what is real (bugs get a failing test first) and repeats
-  until clean, at most 3 rounds. Any stack; knows Godot/GDScript. Use for
+  until clean, at most 3 rounds. Any stack; knows Godot, Unreal and Unity. Use for
   /braid, "braid this", "fix loop", "review and fix", "make it work",
   "доведи до ума", "проверь и исправь".
 argument-hint: "[task | files | audit]"
@@ -21,10 +21,13 @@ Request: $ARGUMENTS
 
 - **Mode.** A task: build it (step 1), then loop over your own edits. `turn: <files>` (sent by braid's stop hook): skip step 1 and loop over the edits you made during this turn in those files; only those edits are in scope. Files or a folder: loop over them. `audit`: the whole project; on a big one, start where a mistake costs most (entry points, saves and data, money, security) and say what you skipped. Nothing: the current changes (`git diff HEAD` plus untracked files; without git, the files changed in this session). Nothing changed: say so and stop.
 - **The user's own edits.** In task mode, before editing, note which files already have uncommitted changes and save their `git diff`. Later, reviewers get only the hunks you wrote.
-- **Project root:** the folder with the project file (`project.godot`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `*.csproj`, ...) that contains the scoped files.
+- **Project root:** the folder with the project file (`project.godot`, `*.uproject`, `ProjectSettings/ProjectVersion.txt`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `*.csproj`, ...) that contains the scoped files.
 - **Baseline.** Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/checks.js" "<root>"` now. Every check that passes now is an anchor and must pass at the end. A check that fails now is pre-existing: fix it only if it is in scope; otherwise leave it for the report. In turn mode and for current changes the edits are already on disk, so there is no clean baseline: a failing check is pre-existing only if its error has nothing to do with these edits or the code that calls them; otherwise it is in scope. When step 1 is skipped, this run is round 1's check run; rerun only after an edit.
 - **No checks found:** add the smallest test that runs the scoped code, or set `.claude/braid.json` to `{"checks": {"test": "<command>"}}`.
+- **SKIP** means a check could not run for a reason outside the code (an open editor, Live Coding, a license, a missing engine). It is neither an anchor nor a failure: name it under Not checked with what it needs.
 - **Godot test:** `tests/<name>_test.gd` that `extends SceneTree`. Put the asserts in `func _initialize():` after `await process_frame`, `load()` project scripts (not `preload`), reach autoloads with `root.get_node("Name")`, and end with `quit(0)` on success or `quit(1)` on failure.
+- **Unreal test:** `Source/<Module>/Private/Tests/<Name>Test.cpp`, inside `#if WITH_DEV_AUTOMATION_TESTS`: `IMPLEMENT_SIMPLE_AUTOMATION_TEST(F<Name>Test, "<Project>.<Area>.<Name>", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)`, then `bool F<Name>Test::RunTest(const FString&)` with `TestEqual`/`TestTrue`, returning `true`. The first part of the test name is what the checks run.
+- **Unity test:** EditMode, in `Assets/Tests/Editor/` with its own asmdef: `references` to the code's asmdef (the code needs one; `Assembly-CSharp` cannot be referenced), `includePlatforms: ["Editor"]`, `defineConstraints: ["UNITY_INCLUDE_TESTS"]`, `overrideReferences: true`, `precompiledReferences: ["nunit.framework.dll"]`, and NUnit `[Test]` methods.
 
 ## 1. Build (only for a task)
 

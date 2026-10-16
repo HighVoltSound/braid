@@ -14,13 +14,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { detect, run, report, snapshot, fingerprint, stateFile, readState, writeState, config, FAST } = require('../scripts/checks.js');
+const { detect, runAfter, report, snapshot, fingerprint, stateFile, readState, writeState, readJson, writeSnap, reviewedFile, config, FAST } = require('../scripts/checks.js');
 
 const MAX_BLOCKS = 3;
 const BUDGET_MS = 240000;
-const MAX_SNAP = 5000; // files; bigger projects get no per-file change list
 const MAX_LISTED = 40;
-const MARKERS = /^(project\.godot|package\.json|deno\.jsonc?|pyproject\.toml|requirements\.txt|setup\.py|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|Package\.swift|pubspec\.yaml|mix\.exs|Gemfile|composer\.json|Makefile|CMakeLists\.txt|.+\.(csproj|sln))$/;
+const MARKERS = /^(project\.godot|package\.json|deno\.jsonc?|pyproject\.toml|requirements\.txt|setup\.py|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|Package\.swift|pubspec\.yaml|mix\.exs|Gemfile|composer\.json|Makefile|CMakeLists\.txt|.+\.(csproj|sln|uproject))$/;
 const LADDER = 'braid autopilot is on. When you write code, make the smallest complete change: skip what nobody asked for, ' +
   'reuse what the project already has, then the standard library or engine, then an installed dependency, then one clear line, ' +
   'and only then the minimum new code. No abstraction, option or config nobody asked for. Reach every caller, scene and test ' +
@@ -30,7 +29,10 @@ const LADDER = 'braid autopilot is on. When you write code, make the smallest co
 // A project has checks or at least a project file: code without checks still gets reviewed.
 function projects(dir) {
   const isProject = d => {
-    try { return detect(d).length > 0 || fs.readdirSync(d).some(f => MARKERS.test(f)); } catch { return false; }
+    try {
+      // Cheap markers first: detect() reads more (engine lookups, test sources).
+      return fs.readdirSync(d).some(f => MARKERS.test(f)) || fs.existsSync(path.join(d, 'ProjectSettings', 'ProjectVersion.txt')) || detect(d).length > 0;
+    } catch { return false; }
   };
   if (isProject(dir)) return [dir];
   let subs = [];
@@ -43,7 +45,7 @@ function defs(root, checks) {
   const read = f => { try { return fs.readFileSync(path.join(root, f), 'utf8'); } catch { return ''; } };
   let scripts = '';
   try { scripts = JSON.stringify(JSON.parse(read('package.json')).scripts || {}); } catch { /* none */ }
-  const fast = checks.filter(c => FAST.test(c.name)).map(c => [c.name, c.cmd || '']);
+  const fast = checks.filter(c => FAST.test(c.name)).map(c => [c.name, c.def || c.cmd || '']);
   return crypto.createHash('sha1').update(JSON.stringify(fast) + scripts + read('.claude/braid.json')).digest('hex');
 }
 
@@ -51,18 +53,23 @@ function defs(root, checks) {
 const snapFile = (root, id) => stateFile(root).replace(/\.json$/, `.${crypto.createHash('sha1').update(id).digest('hex').slice(0, 8)}.snap.json`);
 function saveSnap(root, id, snap) {
   const f = snapFile(root, id);
-  fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(f, Object.keys(snap).length <= MAX_SNAP ? JSON.stringify(snap) : 'null');
+  writeSnap(f, snap);
   for (const name of fs.readdirSync(path.dirname(f))) {
     const p = path.join(path.dirname(f), name);
     try { if (name.endsWith('.snap.json') && Date.now() - fs.statSync(p).mtimeMs > 7 * 864e5) fs.unlinkSync(p); } catch { /* gone */ }
   }
 }
-function changedFiles(root, id, now) {
-  let before = null;
-  try { before = JSON.parse(fs.readFileSync(snapFile(root, id), 'utf8')); } catch { /* none */ }
+// What changed since this session's turn began. A turn that a message of the user did not end can ask for a review
+// twice: a file the first request listed, still as the --reviewed after that request saw it, was reviewed then.
+const value = (snap, f) => (f in snap ? snap[f] : null);
+function changedFiles(root, id, s, now) {
+  const before = readJson(snapFile(root, id));
   if (!before) return null;
-  return [...new Set([...Object.keys(before), ...Object.keys(now)])].filter(f => before[f] !== now[f]).map(f => (f in now ? f : `${f} (deleted)`));
+  let reviewed = null;
+  try { if (s.askedAt && fs.statSync(reviewedFile(root)).mtimeMs > s.askedAt) reviewed = readJson(reviewedFile(root)); } catch { /* none */ }
+  const asked = s.asked || {};
+  return [...new Set([...Object.keys(before), ...Object.keys(now)])].filter(f => before[f] !== now[f]
+    && !(reviewed && asked[f] === value(now, f) && value(reviewed, f) === value(now, f)));
 }
 
 function ponytailOn(dir) {
@@ -111,6 +118,8 @@ async function gate(event, input) {
     const rebase = (base = fp, baseSnap = snap) => {
       Object.assign(s, { base, defs: defs(root, checks), blocks: 0, reviewAsked: false });
       delete s.blockedAt;
+      delete s.asked;
+      delete s.askedAt;
       save();
       saveSnap(root, id, baseSnap);
     };
@@ -136,7 +145,7 @@ async function gate(event, input) {
     if (fp === s.base) continue;
 
     // 1. Fast checks, unless this code already passed them or Claude already saw it fail.
-    const fast = checks.filter(c => !c.missing && (mode === 'all' || FAST.test(c.name)));
+    const fast = checks.filter(c => !c.skip && (mode === 'all' || FAST.test(c.name)));
     if (defs(root, checks) !== s.defs) {
       notes.push(`braid gate: the check commands in ${root} changed during this turn, so they were not run automatically. Run /braid:braid to check.`);
     } else if (fast.length && fp !== state.green && fp !== s.blockedAt) {
@@ -144,11 +153,13 @@ async function gate(event, input) {
       s.blockedAt = fp;
       save();
       const fails = [];
+      const results = {};
       let complete = true;
       for (const c of fast) {
         if (Date.now() - t0 > BUDGET_MS) { complete = false; notes.push(`braid gate: out of time before "${c.name}" in ${root}.`); break; }
-        const r = await run(c, root);
+        const r = results[c.name] = await runAfter(c, root, results);
         if (r.timedOut) { complete = false; notes.push(`braid gate: "${c.name}" in ${root} took longer than ${process.env.BRAID_TIMEOUT}s, so it was not checked.`); }
+        else if (r.skipped) { complete = false; notes.push(`braid gate: ${report(c.name, c.cmd, r)} (${root})`); } // not a failure, but not proof either
         else if (!r.ok) fails.push(report(c.name, c.cmd, r));
       }
       // Fingerprint after the run: a check may rewrite files (lint --fix, codegen).
@@ -169,7 +180,10 @@ async function gate(event, input) {
     }
 
     // 2. The review loop, at most once per turn.
-    if (mode === 'auto' && !s.reviewAsked && fp !== state.reviewed) review.push({ root, s, save, files: changedFiles(root, id, snap) });
+    if (mode === 'auto' && !s.reviewAsked && fp !== state.reviewed) {
+      const files = changedFiles(root, id, s, snap);
+      if (!files || files.length) review.push({ root, s, save, snap, files: files && files.slice(0, MAX_LISTED), more: files ? files.length - MAX_LISTED : 0 });
+    }
   }
 
   if (failed.length) {
@@ -182,11 +196,14 @@ async function gate(event, input) {
     };
   }
   if (review.length) {
-    for (const r of review) { r.s.reviewAsked = true; r.save(); }
-    const scope = review.map(({ root, files }) => {
+    for (const r of review) {
+      r.s.reviewAsked = true;
+      if (r.files) Object.assign(r.s, { asked: { ...r.s.asked, ...Object.fromEntries(r.files.map(f => [f, value(r.snap, f)])) }, askedAt: Date.now() });
+      r.save();
+    }
+    const scope = review.map(({ root, snap, files, more }) => {
       if (!files) return `${root}: the files you changed in this turn`;
-      const more = files.length > MAX_LISTED ? ` and ${files.length - MAX_LISTED} more` : '';
-      return `${root}: ${files.slice(0, MAX_LISTED).join(', ')}${more}`;
+      return `${root}: ${files.map(f => (f in snap ? f : `${f} (deleted)`)).join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
     }).join('; ');
     return {
       decision: 'block',
@@ -194,7 +211,8 @@ async function gate(event, input) {
         `Before finishing, review the edits you made in them: call the Skill tool with skill "braid:braid" and args "turn: ${scope}". ` +
         'Finish without the review only if: you made none of these edits (they are the user\'s: leave them and say so in one line); ' +
         'your edits only touch comments or formatting; you cannot continue without the user\'s answer (not a closing offer of optional extra work); ' +
-        'or you are inside a /braid run that has not reached its report (continue it: it ends with its own review).',
+        'or you are inside a /braid run that has not reached its report (continue it: it ends with its own review).' +
+        (notes.length ? `\n\n${notes.join('\n')}` : ''),
     };
   }
   // Claude may stop: the next turn starts from here, whatever starts it (a prompt or a background notification).
