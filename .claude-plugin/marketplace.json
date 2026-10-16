@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "braid",
+  "description": "Code autopilot for Claude Code: build, check, review, refute, fix, repeat.",
+  "owner": { "name": "HighVoltSound", "url": "https://github.com/HighVoltSound" },
+  "plugins": [
+    {
+      "name": "braid",
+      "description": "Smallest change, real checks, fresh-eyes review, refuted findings, test-first fixes, repeat until clean.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
