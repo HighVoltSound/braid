@@ -1,4 +1,4 @@
-<p align="center"><img src=".github/assets/braid-banner.png" alt="braid: Claude writes it. braid proves it." width="100%"></p>
+<p align="center"><img src=".github/assets/braid-hero.png" alt="braid: Claude writes it. braid proves it." width="100%"></p>
 
 <p align="center">
   <a href="https://github.com/HighVoltSound/braid/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/HighVoltSound/braid/test.yml?branch=main&label=tests" alt="tests"></a>
