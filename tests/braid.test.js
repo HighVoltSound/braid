@@ -154,7 +154,7 @@ test('projects: finds projects one level down', () => {
 test('gate: silent when code is unchanged, blocks on a failing check, then lets go', async () => {
   const d = tmp();
   write(d, 'main.js', 'ok\n');
-  cfg(d, { lint: lintBad });
+  cfg(d, { lint: lintBad }, { gate: 'fast' });
   const input = { cwd: d, session_id: 's1' };
   await gate('turn', input);
   assert.strictEqual(await gate('stop', input), null, 'unchanged code: no checks, no block');
@@ -182,6 +182,7 @@ test('gate: edits made between turns (by the user) do not count', async () => {
   cfg(d, { lint: lintBad });
   const input = { cwd: d, session_id: 's4' };
   await gate('turn', input);
+  assert.strictEqual(await gate('stop', input), null);
   write(d, 'main.js', 'bad, typed by the user\n');
   await gate('turn', input);
   assert.strictEqual(await gate('stop', input), null);
@@ -190,14 +191,42 @@ test('gate: edits made between turns (by the user) do not count', async () => {
 test('gate: check commands changed during the turn are not run', async () => {
   const d = tmp();
   write(d, 'main.js', 'ok\n');
-  cfg(d, { lint: `${node} -e "process.exit(0)"` });
+  cfg(d, { lint: `${node} -e "process.exit(0)"` }, { gate: 'fast' });
   const input = { cwd: d, session_id: 's5' };
   await gate('turn', input);
-  cfg(d, { lint: `${node} -e "require('fs').writeFileSync('ran.txt', 'x'); process.exit(1)"` });
+  cfg(d, { lint: `${node} -e "require('fs').writeFileSync('ran.txt', 'x'); process.exit(1)"` }, { gate: 'fast' });
   write(d, 'main.js', 'changed\n');
   const out = await gate('stop', input);
   assert.ok(out && !out.decision && /changed during this turn/.test(out.systemMessage));
   assert.ok(!fs.existsSync(path.join(d, 'ran.txt')));
+});
+
+test('auto: changed check commands skip the checks but still get the review request', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: `${node} -e "process.exit(0)"` });
+  const input = { cwd: d, session_id: 'a5' };
+  await gate('turn', input);
+  cfg(d, { lint: `${node} -e "require('fs').writeFileSync('ran.txt', 'x'); process.exit(1)"` });
+  write(d, 'main.js', 'changed\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot/);
+  assert.ok(!fs.existsSync(path.join(d, 'ran.txt')));
+});
+
+test('auto: adding a Godot test (not a fast check) keeps the gate on', async () => {
+  const d = tmp();
+  const fake = path.join(ROOT, WIN ? 'fakegodot.cmd' : 'fakegodot');
+  write(ROOT, path.basename(fake), WIN ? '@exit /b 0\r\n' : '#!/bin/sh\nexit 0\n');
+  if (!WIN) fs.chmodSync(fake, 0o755);
+  write(d, 'project.godot', 'config_version=5\n');
+  write(d, 'player.gd', 'extends Node\n');
+  cfg(d, undefined, { godot: fake });
+  const input = { cwd: d, session_id: 'a6' };
+  await gate('turn', input);
+  write(d, 'player.gd', 'extends Node2D\n');
+  write(d, 'tests/player_test.gd', 'extends SceneTree\nfunc _initialize():\n\tquit(0)\n');
+  const out = await gate('stop', input);
+  assert.match(out.reason, /braid autopilot.*player\.gd.*player_test\.gd/s);
 });
 
 test('gate: off in config disables it', async () => {
@@ -212,7 +241,7 @@ test('gate: off in config disables it', async () => {
 test('gate: gives up after three blocks in one turn, and starts over next turn', async () => {
   const d = tmp();
   write(d, 'main.js', '0');
-  cfg(d, { lint: `${node} -e "process.exit(1)"` });
+  cfg(d, { lint: `${node} -e "process.exit(1)"` }, { gate: 'fast' });
   const input = { cwd: d, session_id: 's3' };
   await gate('turn', input);
   for (let i = 1; i <= 3; i++) {
@@ -227,10 +256,143 @@ test('gate: gives up after three blocks in one turn, and starts over next turn',
   assert.strictEqual((await gate('stop', input)).decision, 'block');
 });
 
+test('auto: after green checks, asks once per turn for the review loop on the files this turn changed', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  write(d, 'other.js', 'user wip\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'a1' };
+  await gate('turn', input);
+  write(d, 'main.js', 'changed by Claude\n');
+  const out = await gate('stop', input);
+  assert.strictEqual(out.decision, 'block');
+  assert.match(out.reason, /skill "braid:braid" and args "turn: .*main\.js/);
+  assert.doesNotMatch(out.reason, /other\.js/, 'files changed before the turn are not listed');
+  write(d, 'main.js', 'fixed during the loop\n');
+  assert.strictEqual(await gate('stop', input), null, 'at most one review request per turn');
+  await gate('turn', input);
+  write(d, 'main.js', 'next turn\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot/);
+  assert.strictEqual(await gate('stop', input), null, 'stopping again without edits is allowed');
+});
+
+test('auto: a turn started without a prompt (background notification) is reviewed too', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'a7' };
+  await gate('turn', input);
+  write(d, 'main.js', 'turn one\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot/);
+  assert.strictEqual(await gate('stop', input), null, 'Claude called it trivial and stopped');
+  write(d, 'main.js', 'turn two, no prompt before it\n');
+  const out = await gate('stop', input);
+  assert.match(out.reason, /braid autopilot/);
+  assert.doesNotMatch(out.reason, /other/);
+});
+
+test('auto: edits made before an interrupt still count after "continue"', async () => {
+  const d = tmp();
+  write(d, 'a.js', 'a\n');
+  write(d, 'b.js', 'b\n');
+  cfg(d, { lint: `${node} -e "process.exit(0)"` });
+  const input = { cwd: d, session_id: 'a8' };
+  await gate('turn', input);
+  write(d, 'a.js', 'a edited, then Esc\n');
+  await gate('turn', input); // "continue": no Stop ran in between
+  write(d, 'b.js', 'b edited\n');
+  assert.match((await gate('stop', input)).reason, /a\.js.*b\.js/s);
+});
+
+test('auto: a project created during the turn is checked and reviewed', async () => {
+  const d = tmp();
+  const input = { cwd: d, session_id: 'a9' };
+  await gate('turn', input); // empty folder: no project yet
+  write(d, 'package.json', JSON.stringify({ scripts: {} }));
+  write(d, 'main.js', 'new app\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot.*main\.js/s);
+});
+
+test('auto: code with a project file but no checks is still reviewed', async () => {
+  const d = tmp();
+  write(d, 'requirements.txt', 'requests\n');
+  write(d, 'app.py', 'print(1)\n');
+  const input = { cwd: d, session_id: 'a10' };
+  await gate('turn', input);
+  write(d, 'app.py', 'print(2)\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot.*app\.py/s);
+});
+
+test('auto: after three blocks, a fix that turns the checks green still gets reviewed', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'a11' };
+  await gate('turn', input);
+  for (let i = 1; i <= 3; i++) {
+    write(d, 'main.js', `bad ${'x'.repeat(i)}\n`);
+    assert.match((await gate('stop', input)).reason, /FAIL lint/);
+  }
+  write(d, 'main.js', 'fixed now\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot/);
+});
+
+test('auto: in a folder of projects, a failing project does not use up the other project\'s review', async () => {
+  const d = tmp();
+  for (const p of ['a', 'b']) { write(d, `${p}/main.js`, 'ok\n'); cfg(path.join(d, p), { lint: lintBad }); }
+  const input = { cwd: d, session_id: 'a12' };
+  await gate('turn', input);
+  write(d, 'a/main.js', 'bad\n');
+  write(d, 'b/main.js', 'fine\n');
+  assert.match((await gate('stop', input)).reason, /FAIL lint/);
+  write(d, 'a/main.js', 'good\n');
+  const out = await gate('stop', input);
+  assert.ok(out.reason.includes(path.join(d, 'a')) && out.reason.includes(path.join(d, 'b')), out.reason);
+});
+
+test('run: a check that only runs out of time is reported as timed out, not failed', async () => {
+  const r = await run({ cmd: `${node} -e "setTimeout(() => {}, 5000)"`, timeoutMs: 800 }, tmp());
+  assert.strictEqual(r.timedOut, true);
+});
+
+test('auto: failing checks come first, the review request after they pass', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'a2' };
+  await gate('turn', input);
+  write(d, 'main.js', 'bad\n');
+  assert.match((await gate('stop', input)).reason, /FAIL lint/);
+  write(d, 'main.js', 'good\n');
+  assert.match((await gate('stop', input)).reason, /braid autopilot/);
+});
+
+test('auto: code already marked reviewed by checks.js --reviewed is not asked again', async () => {
+  const d = tmp();
+  write(d, 'main.js', 'ok\n');
+  cfg(d, { lint: lintBad });
+  const input = { cwd: d, session_id: 'a3' };
+  await gate('turn', input);
+  write(d, 'main.js', 'reviewed edit\n');
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'checks.js'), d, '--reviewed'], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(await gate('stop', input), null);
+});
+
+test('start: hands over the ladder unless ponytail is enabled', async () => {
+  const d = tmp();
+  const out = await gate('context', { cwd: d });
+  assert.match(out.hookSpecificOutput.additionalContext, /smallest complete change/);
+  write(ROOT, '.claude/settings.json', JSON.stringify({ enabledPlugins: { 'ponytail@ponytail': true } }));
+  assert.strictEqual(await gate('context', { cwd: d }), null);
+  fs.rmSync(path.join(ROOT, '.claude'), { recursive: true, force: true });
+});
+
 test('gate: a missing Godot binary does not block', async () => {
   const d = tmp();
   write(d, 'project.godot', 'config_version=5\n');
   write(d, 'main.gd', 'extends Node\n');
+  cfg(d, undefined, { gate: 'fast' });
   if (detect(d).some(c => !c.missing && c.name === 'godot-import')) return; // a real Godot is on PATH
   const input = { cwd: d, session_id: 's6' };
   await gate('turn', input);

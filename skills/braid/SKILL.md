@@ -19,10 +19,10 @@ Request: $ARGUMENTS
 
 ## 0. Scope and baseline
 
-- **Mode.** A task: build it (step 1), then loop over your own edits. Files or a folder: loop over them. `audit`: the whole project; on a big one, start where a mistake costs most (entry points, saves and data, money, security) and say what you skipped. Nothing: the current changes (`git diff HEAD` plus untracked files; without git, the files changed in this session). Nothing changed: say so and stop.
+- **Mode.** A task: build it (step 1), then loop over your own edits. `turn: <files>` (sent by braid's stop hook): skip step 1 and loop over the edits you made during this turn in those files; only those edits are in scope. Files or a folder: loop over them. `audit`: the whole project; on a big one, start where a mistake costs most (entry points, saves and data, money, security) and say what you skipped. Nothing: the current changes (`git diff HEAD` plus untracked files; without git, the files changed in this session). Nothing changed: say so and stop.
 - **The user's own edits.** In task mode, before editing, note which files already have uncommitted changes and save their `git diff`. Later, reviewers get only the hunks you wrote.
 - **Project root:** the folder with the project file (`project.godot`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `*.csproj`, ...) that contains the scoped files.
-- **Baseline.** Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/checks.js" "<root>"` now. Every check that passes now is an anchor and must pass at the end. A check that fails now is pre-existing: fix it only if it is in scope; otherwise leave it for the report.
+- **Baseline.** Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/checks.js" "<root>"` now. Every check that passes now is an anchor and must pass at the end. A check that fails now is pre-existing: fix it only if it is in scope; otherwise leave it for the report. In turn mode and for current changes the edits are already on disk, so there is no clean baseline: a failing check is pre-existing only if its error has nothing to do with these edits or the code that calls them; otherwise it is in scope. When step 1 is skipped, this run is round 1's check run; rerun only after an edit.
 - **No checks found:** add the smallest test that runs the scoped code, or set `.claude/braid.json` to `{"checks": {"test": "<command>"}}`.
 - **Godot test:** `tests/<name>_test.gd` that `extends SceneTree`. Put the asserts in `func _initialize():` after `await process_frame`, `load()` project scripts (not `preload`), reach autoloads with `root.get_node("Name")`, and end with `quit(0)` on success or `quit(1)` on failure.
 
@@ -39,9 +39,9 @@ Each round:
 1. **Checks.** Run them all. An anchor turned red or a new failure: read the error, reproduce it, fix the root cause, rerun. Leave pre-existing failures outside the scope alone.
 2. **Review.** In one message, spawn three `braid:reviewer` agents in parallel, lenses `correctness`, `risk`, `lean`. Give each:
    - the task in one paragraph;
-   - the mode: "diff" (task or current changes) or "whole files, no diff" (files or audit);
+   - the mode: "diff" (task, turn or current changes) or "whole files, no diff" (files or audit);
    - the project root and the scoped files;
-   - how to see the change: `git diff HEAD -- <files>`, only your own hunks in task mode, or the list of edited files;
+   - how to see the change: `git diff HEAD -- <files>`, only your own hunks in task and turn mode (quote the edited functions when git cannot separate them), or the list of edited files;
    - the latest check summary.
 
    Do not pass your reasoning: fresh eyes are the point. From round 2, scope them to the files the last round changed, and pass the last findings so they mark each ADDRESSED or NOT and look for new breakage in that diff.
@@ -55,7 +55,7 @@ Each round:
 
 ## 3. Report
 
-In the user's language, short:
+Last command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/checks.js" "<root>" --reviewed`, so the stop hook does not ask to review this same code again. Then report in the user's language, short:
 
 - **Changed:** two or three lines.
 - **Checks:** each check PASS or FAIL from a fresh run made after the last edit. Never from memory.

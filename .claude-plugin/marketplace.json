@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "braid",
-      "description": "Smallest change, real checks, fresh-eyes review, refuted findings, test-first fixes, repeat until clean.",
+      "description": "Automatic after every turn that changes code: real checks, fresh-eyes review, refuted findings, test-first fixes. Pairs with ponytail.",
       "source": "./",
       "category": "development"
     }

@@ -1,12 +1,12 @@
 # braid
 
-**Code autopilot for Claude Code.** You give a task; braid does it with the smallest change, then runs your project's real checks, gets a fresh-eyes review, tries to refute every finding, fixes what is real (bugs get a failing test first) and repeats until clean. You read the result.
+**Code autopilot for Claude Code.** Install it and keep working as usual. Whenever Claude changes code in a turn, braid runs your project's real checks, gets a fresh-eyes review, tries to refute every finding, fixes what is real (bugs get a failing test first) and repeats until clean, before Claude hands the turn back. You read the result.
 
 [Русская версия](README.ru.md)
 
 ```mermaid
 flowchart LR
-  T[task] --> B[build: smallest change]
+  T[your request] --> B[Claude writes<br/>the smallest change]
   B --> C[run real checks]
   C --> R[3 fresh reviewers<br/>correctness · risk · lean]
   R --> S[skeptic per finding<br/>default: refuted]
@@ -20,8 +20,8 @@ Why it is built this way:
 - **Checks decide, not the model.** Tests, type checkers, linters and Godot's own compiler are ground truth. "Should work" is not evidence.
 - **Fresh eyes.** Reviewers are subagents that never saw how the code was written.
 - **Most review findings are wrong.** Every finding goes to a skeptic that tries to disprove it, so noise doesn't turn into needless edits.
-- **Bounded.** At most 3 rounds. Repeated fixes of the same thing stop and get reported as "needs redesign" instead of churning.
-- **Lean.** The build step follows the [ponytail](https://github.com/DietrichGebert/ponytail) ladder: skip what isn't needed, reuse, standard library, one line, then the minimum code.
+- **Bounded.** At most 3 rounds and one loop per turn. Repeated fixes of the same thing stop and get reported as "needs redesign" instead of churning.
+- **Lean.** Code is written by the [ponytail](https://github.com/DietrichGebert/ponytail) ladder: skip what isn't needed, reuse, standard library, one line, then the minimum code.
 
 ## Install
 
@@ -30,11 +30,28 @@ Why it is built this way:
 /plugin install braid@braid
 ```
 
-Requires Node.js 18+ on PATH (the hooks and the check runner are Node scripts).
+Requires Node.js 18+ on PATH (the hooks and the check runner are Node scripts). Start a new session after installing.
 
-Recommended companion: `/plugin marketplace add DietrichGebert/ponytail` and `/plugin install ponytail@ponytail`. braid works without it.
+## Works best with Ponytail
 
-## Use
+[**Ponytail**](https://github.com/DietrichGebert/ponytail) by Dietrich Gebert makes Claude write the smallest code that solves the task, in every session and every subagent. braid is the other half: it proves the code works and fixes what doesn't. Together, Ponytail keeps the code short while it is being written, and braid checks, reviews and repairs it at the end of each turn.
+
+```
+/plugin marketplace add DietrichGebert/ponytail
+/plugin install ponytail@ponytail
+```
+
+braid works without it: when Ponytail is not enabled, braid gives Claude a short version of the same ladder at session start. When Ponytail is enabled, braid stays out of its way and does not repeat it.
+
+## How it works
+
+**Automatic (default).** Nothing to type. At the end of every turn in which Claude changed code, braid's stop hook:
+
+1. Runs the fast checks (types, lint, compile; Godot: headless import and a compile of every script and scene). If they fail, Claude may not finish until it fixes them.
+2. Then asks Claude, once per turn, to run the braid review loop on exactly the files this turn changed. braid works out the list itself, with or without git. Your own edits between turns never count.
+3. Lets Claude skip the loop when its edits only touch comments or formatting, when the changed files are not its own edits, or when it must wait for your answer, if it says so in one line.
+
+**By hand,** any time:
 
 | Command | What it does |
 |---|---|
@@ -44,6 +61,12 @@ Recommended companion: `/plugin marketplace add DietrichGebert/ponytail` and `/p
 | `/braid:braid audit` | Loops over the whole project |
 
 The report lists every check with PASS or FAIL from a fresh run, what was fixed (with `path:line`), the decisions it made instead of asking you, and what no check covers.
+
+**Cost.** One automatic loop is several subagent calls: in testing, 2-4 minutes and about $0.25-2 of usage per turn that changes code (most real turns in testing: $0.60-0.72). For checks only, set `{"gate": "fast"}` in `.claude/braid.json` and run `/braid:braid` yourself when you want the full loop.
+
+The stop hook lets Claude go when the code did not change this turn or matches the last green or reviewed run, when Claude stops again without editing (for example, a failure that was already there), after 3 blocks in one turn, or when the check commands themselves changed during the turn (it never runs new commands unasked). A missing Godot binary never blocks, and the hook gives up rather than run past its time limit. It also works when the session is opened in a folder of projects (such as `GODOT_PROJECTS/`), handling each changed project inside.
+
+**Trust:** the hook runs whatever check commands the checkout defines (`npm run lint` and the config it loads, `.claude/braid.json` entries, Godot import, which runs the project's editor plugins). That is the same trust you give a project's `.claude/settings.json` hooks. Use it on code you trust. State is kept per user in `~/.cache/braid`.
 
 ## Checks it finds by itself
 
@@ -65,23 +88,6 @@ Anything else: one line in `.claude/braid.json`:
 
 Run them yourself with `node <plugin>/scripts/checks.js [dir] [--list] [--fast]`.
 
-## The stop gate
-
-braid also adds a Stop hook. When Claude changed source files during a turn and is about to finish, it runs the fast checks (types, lint, compile; no tests or builds) and refuses to stop while they fail. It shows Claude the errors, and lets go if:
-
-- the code did not change during this turn, or matches the last green run (your own edits between turns never count);
-- Claude stops again without editing (for example, the failure was already there before);
-- it already blocked 3 times this turn;
-- the check commands themselves changed during the turn (it will not run new commands unasked; run `/braid:braid` instead).
-
-A missing Godot binary never blocks. The gate gives up rather than run past the hook's time limit.
-
-It also works when the session is opened in a folder of projects (such as `GODOT_PROJECTS/`), checking each changed project inside.
-
-Turn it off with `{"gate": "off"}` in `.claude/braid.json` or `BRAID_GATE=off`. Use `"all"` to also run tests on every stop.
-
-**Trust:** the gate runs whatever check commands the checkout defines (`npm run lint` and the config it loads, `.claude/braid.json` entries, Godot import, which runs the project's editor plugins). That is the same trust you give a project's `.claude/settings.json` hooks. Use it on code you trust. State is kept per user in `~/.cache/braid`.
-
 ## Godot notes
 
 - Godot 4 projects only (`config_version=5`). For Godot 3, put your checks in `.claude/braid.json`.
@@ -96,12 +102,12 @@ Turn it off with `{"gate": "off"}` in `.claude/braid.json` or `BRAID_GATE=off`. 
 
 | Where | Key | Meaning |
 |---|---|---|
+| `.claude/braid.json` | `gate` | `auto` (default: fast checks, then the review loop), `fast` (checks only), `all` (all checks including tests, no loop) or `off`. |
 | `.claude/braid.json` | `checks` | Map of name to command. Replaces detection. |
 | `.claude/braid.json` | `godot` | Path to the Godot binary. |
-| `.claude/braid.json` | `gate` | `fast` (default), `all` or `off`. |
+| env | `BRAID_GATE` | Overrides `gate` for every project. |
 | env | `GODOT_BIN` | Path to the Godot binary. |
-| env | `BRAID_GATE` | Overrides `gate`. |
-| env | `BRAID_TIMEOUT` | Seconds per check, default 600 (120 inside the stop gate). |
+| env | `BRAID_TIMEOUT` | Seconds per check, default 600 (120 inside the stop hook). |
 
 ## Tested
 
@@ -113,11 +119,21 @@ Before release, `claude -p "/braid:braid audit"` ran on three small projects (Ja
 | Python | 2/2 | yes | kept, as a recorded ruling (public name in an installable package) | green |
 | Godot 4.7 | 2/2, each with a failing test first | yes | yes | green |
 
-Each run took 2-4 minutes. In task mode ("add a remove command") it made a one-line change with a test, and it reported an out-of-scope bug instead of touching it. A live session confirmed the stop gate blocks a broken GDScript edit.
+Each run took 2-4 minutes. In task mode ("add a remove command") it made a one-line change with a test, and it reported an out-of-scope bug instead of touching it. A live session confirmed the stop hook blocks a broken GDScript edit.
+
+The automatic mode was tested with plain requests and no `/braid` typed:
+
+| Request | What happened | Usage |
+|---|---|---|
+| "Add `cheapest(items)` and a CLI command" (JavaScript) | the stop hook asked for the loop on the 3 changed files; 3 reviewers, nothing to fix | $0.60 |
+| "Add `heaviest(items)`" (Godot 4.7) | same, with a new test and green Godot checks | $0.62 |
+| "Change the docstring" (Python) | the hook asked; Claude skipped the loop as a comments-only change | $0.25 |
 
 ## Limits
 
 braid can only be as sure as your checks. It writes a test for every bug it fixes, so coverage grows with each run, but it cannot see what nothing measures: how a game feels, visuals, performance on a real device. It says so in every report.
+
+The stop hook tells changes apart by time, not by author. Files you edit while Claude is working (or that another session or an editor autosave writes) show up in that turn's list; Claude is told to leave edits that are not its own. Two sessions working in one project share the "reviewed" mark.
 
 ## Credits
 

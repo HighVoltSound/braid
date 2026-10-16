@@ -1,7 +1,7 @@
 {
   "name": "braid",
-  "version": "0.1.0",
-  "description": "Code autopilot: smallest change, real checks, fresh-eyes review, refuted findings, test-first fixes, repeat until clean. Any stack, Godot-aware.",
+  "version": "0.2.0",
+  "description": "Code autopilot: after every turn that changes code, real checks, a fresh-eyes review, refuted findings and test-first fixes, automatically. Any stack, Godot-aware. Pairs with ponytail.",
   "author": { "name": "HighVoltSound", "url": "https://github.com/HighVoltSound" },
   "repository": "https://github.com/HighVoltSound/braid",
   "license": "MIT",

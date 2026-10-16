@@ -6,7 +6,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.js\" turn",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.js\" start",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.js\" context",
             "timeout": 15
           }
         ]

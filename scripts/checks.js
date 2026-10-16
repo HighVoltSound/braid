@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Finds and runs a project's real checks: types, lint, tests, build.
-// Usage: node checks.js [dir] [--list] [--fast]   Exit: 0 all green, 1 something failed, 3 no checks found.
+// Usage: node checks.js [dir] [--list] [--fast] [--reviewed]   Exit: 0 all green, 1 something failed, 3 no checks found.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -165,13 +165,14 @@ function run(check, root) {
     let note = '';
     let killTimer = null;
     let done = false;
+    let timedOut = false;
     const finish = status => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
       const ok = (check.okCodes || [0]).includes(status) && !note && !(check.failOn && check.failOn.test(out));
-      resolve({ ok, out: note ? `${out}\n${note}` : out, secs: (Date.now() - start) / 1000, status });
+      resolve({ ok, timedOut, out: note ? `${out}\n${note}` : out, secs: (Date.now() - start) / 1000, status });
     };
     const kill = msg => {
       note = msg;
@@ -179,7 +180,8 @@ function run(check, root) {
       // A grandchild that escaped the kill can hold the pipes open: do not wait for it.
       setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); finish(null); }, 5000).unref();
     };
-    const timer = setTimeout(() => kill(`TIMED OUT after ${TIMEOUT_MS / 1000}s`), TIMEOUT_MS);
+    const limit = check.timeoutMs || TIMEOUT_MS;
+    const timer = setTimeout(() => { timedOut = true; kill(`TIMED OUT after ${limit / 1000}s`); }, limit);
     const onData = d => {
       out += d;
       if (out.length > 4e6) out = out.slice(-2e6);
@@ -197,8 +199,8 @@ function killTree(child) {
   else try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
 }
 
-// Cheap signature of the code on disk: path, size and mtime of every source file.
-function fingerprint(root) {
+// Every source file with its size and mtime, so changes can be spotted without reading contents.
+function snapshot(root) {
   let files = [];
   // -z: git quotes non-ASCII paths otherwise, and those would drop out.
   const git = spawnSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -216,10 +218,17 @@ function fingerprint(root) {
     };
     walk('');
   }
-  const h = crypto.createHash('sha1');
+  const snap = {};
   for (const f of files.sort()) {
-    try { const s = fs.statSync(path.join(root, f)); h.update(`${f}:${s.size}:${s.mtimeMs}\n`); } catch { /* deleted */ }
+    try { const s = fs.statSync(path.join(root, f)); snap[f] = `${s.size}:${s.mtimeMs}`; } catch { /* deleted */ }
   }
+  return snap;
+}
+
+// Cheap signature of the code on disk.
+function fingerprint(root, snap = snapshot(root)) {
+  const h = crypto.createHash('sha1');
+  for (const [f, v] of Object.entries(snap)) h.update(`${f}:${v}\n`);
   return h.digest('hex');
 }
 
@@ -243,6 +252,8 @@ function report(name, cmd, r) {
 async function main() {
   const args = process.argv.slice(2);
   const root = path.resolve(args.find(a => !a.startsWith('--')) || process.cwd());
+  // End of a /braid loop: the stop gate will not ask for another review of this exact code.
+  if (args.includes('--reviewed')) { writeState(root, { ...readState(root), reviewed: fingerprint(root) }); console.log('braid: marked as reviewed'); return 0; }
   const fast = args.includes('--fast');
   const checks = detect(root).filter(c => !fast || FAST.test(c.name));
   if (!checks.length) { console.log('braid checks: none found (add "checks" to .claude/braid.json)'); return 3; }
@@ -262,4 +273,4 @@ async function main() {
 
 if (require.main === module) main().then(code => process.exit(code));
 
-module.exports = { detect, run, report, findGodot, fingerprint, readState, writeState, config, FAST };
+module.exports = { detect, run, report, findGodot, snapshot, fingerprint, stateFile, readState, writeState, config, FAST };
