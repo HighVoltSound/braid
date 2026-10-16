@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/HighVoltSound/braid/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/HighVoltSound/braid/test.yml?branch=main&label=tests" alt="tests"></a>
-  <a href="https://github.com/HighVoltSound/braid/releases"><img src="https://img.shields.io/github/v/release/HighVoltSound/braid" alt="release"></a>
+  <a href="https://github.com/HighVoltSound/braid/releases"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FHighVoltSound%2Fbraid%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&label=release&prefix=v&color=blue" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="license: MIT"></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white" alt="node >=20"></a>
   <a href="https://code.claude.com/docs/en/plugins"><img src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white" alt="Claude Code plugin"></a>
