@@ -14,10 +14,18 @@ All notable changes to braid are listed here. The format follows [Keep a Changel
 ### Changed
 
 - In CI (`CI` or `GITHUB_ACTIONS` set) the hooks do nothing unless `BRAID_GATE` is set.
-- `BRAID_GATE` is validated: only `auto`, `fast`, `all` and `off` are accepted.
+- Gate modes are validated everywhere: `auto`, `fast`, `all`, `off`; `false`, `0` and `no` mean `off`; anything else warns once and acts as `auto`.
 - Node.js 20 or later is required.
 - English only: the Russian README and the Russian trigger phrases in the skill description are gone.
 - The skill no longer triggers on "make it work", which fired too easily.
+
+### Fixed
+
+- Every check the stop hook runs fits its time budget, so the hook never runs past Claude Code's limit; checks are killed with the hook, or with `checks.js`, on SIGTERM/SIGINT.
+- Internal errors are shown as one line instead of being swallowed; braid still lets Claude stop.
+- State is written atomically (retried briefly on Windows), and old state is pruned: only braid's own files, after 7 or 30 days.
+- Windows: programs are never run from the project folder by bare name (the Gradle wrapper runs as `.\gradlew.bat`); Program Files paths come from the environment.
+- Unity test results live in the per-user state folder instead of the shared temp folder.
 
 ## [0.3.0] - 2026-10-16
 
