@@ -59,16 +59,7 @@ braid works without it: when Ponytail is not enabled, braid gives Claude a short
 
 ## How it works
 
-```mermaid
-flowchart LR
-  T[your request] --> B[Claude writes<br/>the smallest change]
-  B --> C[run real checks]
-  C --> R[3 fresh reviewers<br/>correctness · risk · lean]
-  R --> S[skeptic per finding<br/>default: refuted]
-  S --> F[fix confirmed<br/>bug: failing test first]
-  F --> C
-  C -->|green, nothing confirmed<br/>or 3 rounds| D[report with evidence]
-```
+<p align="center"><img src=".github/assets/braid-how-it-works.gif" alt="braid loop: run your tests, 3 fresh reviewers, skeptic filter, fix test-first, repeat up to 3 rounds, then a report" width="100%"></p>
 
 **Automatic (default).** At the end of every turn in which Claude changed code, braid's stop hook:
 
@@ -88,6 +79,8 @@ flowchart LR
 | `/braid:braid audit` | Loops over the whole project |
 
 The report lists every check as PASS, FAIL or SKIP from a fresh run, what was fixed (with `path:line`), the decisions it made instead of asking you, and what no check covers.
+
+<p align="center"><img src=".github/assets/braid-report.png" alt="A real braid report: checks PASS, 13 findings confirmed and 3 refuted, fixes listed, one needs-redesign ruling" width="85%"><br><sub>A real report, shortened: braid reviewing its own Unreal and Unity support.</sub></p>
 
 The stop hook lets Claude go when:
 
